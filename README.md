@@ -16,13 +16,13 @@ Ocilot is a command-line tool and Rust library for interacting with OCI (Open Co
 ### Using Cargo
 
 ```bash
-cargo install ocilot
+cargo install --git https://github.com/awslabs/ocilot.git
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/username/ocilot
+git clone https://github.com/awslabs/ocilot.git
 cd ocilot
 cargo build --release
 ```
