@@ -30,100 +30,106 @@ pub struct Registry {
     uri: RegistryUri,
     /// Registry client to use
     pub(crate) client: RegistryClient,
+    #[cfg(feature = "aws")]
+    is_public_ecr: bool,
 }
 
 unsafe impl Send for Registry {}
 unsafe impl Sync for Registry {}
 
-async fn discover_auth(registry: &RegistryUri) -> crate::Result<Option<Token>> {
-    // First check our common auth files for an entry
-    for file in COMMON_AUTH_FILES {
-        if let Ok(Some(path)) = my_home() {
-            let path = path.join(file);
-            if path.exists() {
-                let auth = tokio::fs::read_to_string(path)
-                    .await
-                    .context(error::FileSnafu)?;
-                let config: DockerConfig =
-                    serde_json::from_str(&auth).context(error::ConfigDeserializeSnafu)?;
-                if let Some(entry) = config.auths.get(registry.base()) {
-                    // If both the auth and identity token are null then the password is probably stored in the system keychai
-                    if entry.auth.is_none() && entry.identitytoken.is_none() {
-                        if let Ok(entry) = Entry::new("docker-credential-helpers", registry.base())
-                        {
-                            if let Ok(password) = entry.get_password() {
-                                let decoded = base64::engine::general_purpose::STANDARD
-                                    .decode(password)
-                                    .unwrap();
-                                let decoded = String::from_utf8_lossy(decoded.as_slice());
-                                if decoded.contains(':') {
-                                    let (username, password) = decoded.split_once(':').unwrap();
-                                    return Ok(Some(Token::Basic {
-                                        username: username.to_string(),
-                                        password: password.to_string(),
-                                    }));
-                                } else {
-                                    return Ok(Some(Token::Bearer(decoded.to_string())));
-                                }
-                            } else {
-                                return Ok(None);
-                            }
-                        }
-                    }
-                    return Ok(Token::parse(entry.clone()));
-                }
-            }
-        }
-    }
-    // If we get here then we may want to try and utilize credential helpers for given registry types
-    cfg_if! {
-        if #[cfg(feature = "aws")] {
-            if registry.base().starts_with("public.ecr.aws") {
-                debug!(target: "registry", "using public ecr");
-                // Public ecr
-                let sdk_config = aws_config::defaults(BehaviorVersion::latest()).region("us-east-1").load().await;
-                let ecr_client = aws_sdk_ecrpublic::Client::new(&sdk_config);
-                let ecr_response = ecr_client.get_authorization_token().send()
-                    .await
-                    .map_err(|e| { error!("public ecr: {:?}", e); error::Error::Authorization { reason: e.to_string() } })?;
-                trace!(target: "registry", "public ecr authorization response: {:?}", ecr_response);
-                Ok(ecr_response.authorization_data()
-                    .and_then(|x| x.authorization_token.clone()
-                    .map(Token::Bearer)))
-            } else if registry.base().contains("ecr") {
-                debug!(target: "registry", "using private ecr");
-                let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-                let ecr_client = aws_sdk_ecr::Client::new(&sdk_config);
-                let ecr_response = ecr_client.get_authorization_token()
-                    .send()
-                    .await
-                    .map_err(|e| error::Error::Authorization { reason: e.to_string() })?;
-                trace!(target: "registry", "private ecr authorization response: {:?}", ecr_response);
-                Ok(ecr_response.authorization_data()
-                    .first()
-                    .and_then(|x| {
-                        x.authorization_token().map(|y| {
-                            let decoded = base64::engine::general_purpose::STANDARD.decode(y).unwrap();
-                            Token::Basic { username: "AWS".to_string(), password: String::from_utf8_lossy(decoded.as_slice()).strip_prefix("AWS:").unwrap().to_string() }
-                        })
-                    }))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-}
-
 impl Registry {
     /// Given a uri to a registry create a new registry client and gather
     /// the appropriate authorization.
     pub async fn new(uri: &RegistryUri) -> Result<Self> {
-        let token = discover_auth(uri).await?;
+        // First check our common auth files for an entry
+        let mut token = None;
+        #[cfg(feature = "aws")]
+        let mut is_public_ecr = false;
+        // If we get here then we may want to try and utilize credential helpers for given registry types
+        cfg_if! {
+            if #[cfg(feature = "aws")] {
+                if uri.base().starts_with("public.ecr.aws") {
+                    debug!(target: "registry", "using public ecr");
+                    // Public ecr
+                    let sdk_config = aws_config::defaults(BehaviorVersion::latest()).region("us-east-1").load().await;
+                    let client = aws_sdk_ecrpublic::Client::new(&sdk_config);
+                    let ecr_response = client.get_authorization_token().send()
+                        .await
+                        .map_err(|e| { error!("public ecr: {:?}", e); error::Error::Authorization { reason: e.to_string() } })?;
+                    trace!(target: "registry", "public ecr authorization response: {:?}", ecr_response);
+                    is_public_ecr = true;
+                    token = ecr_response.authorization_data()
+                        .and_then(|x| x.authorization_token.clone()
+                        .map(Token::Bearer));
+                } else if uri.base().contains("ecr") {
+                    debug!(target: "registry", "using private ecr");
+                    let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+                    let ecr_client = aws_sdk_ecr::Client::new(&sdk_config);
+                    let ecr_response = ecr_client.get_authorization_token()
+                        .send()
+                        .await
+                        .map_err(|e| error::Error::Authorization { reason: e.to_string() })?;
+                    trace!(target: "registry", "private ecr authorization response: {:?}", ecr_response);
+                    token = ecr_response.authorization_data()
+                        .first()
+                        .and_then(|x| {
+                            x.authorization_token().map(|y| {
+                                let decoded = base64::engine::general_purpose::STANDARD.decode(y).unwrap();
+                                Token::Basic { username: "AWS".to_string(), password: String::from_utf8_lossy(decoded.as_slice()).strip_prefix("AWS:").unwrap().to_string() }
+                            })
+                        });
+                }
+            }
+        }
+        if token.is_none() {
+            // If a token hasn't been resolved try the keyring
+            for file in COMMON_AUTH_FILES {
+                if let Ok(Some(path)) = my_home() {
+                    let path = path.join(file);
+                    if path.exists() {
+                        let auth = tokio::fs::read_to_string(path)
+                            .await
+                            .context(error::FileSnafu)?;
+                        let config: DockerConfig =
+                            serde_json::from_str(&auth).context(error::ConfigDeserializeSnafu)?;
+                        if let Some(entry) = config.auths.get(uri.base()) {
+                            // If both the auth and identity token are null then the password is probably stored in the system keychai
+                            if entry.auth.is_none() && entry.identitytoken.is_none() {
+                                if let Ok(entry) =
+                                    Entry::new("docker-credential-helpers", uri.base())
+                                {
+                                    if let Ok(password) = entry.get_password() {
+                                        let decoded = base64::engine::general_purpose::STANDARD
+                                            .decode(password)
+                                            .unwrap();
+                                        let decoded = String::from_utf8_lossy(decoded.as_slice());
+                                        if decoded.contains(':') {
+                                            let (username, password) =
+                                                decoded.split_once(':').unwrap();
+                                            token = Some(Token::Basic {
+                                                username: username.to_string(),
+                                                password: password.to_string(),
+                                            });
+                                        } else {
+                                            token = Some(Token::Bearer(decoded.to_string()));
+                                        }
+                                    } else {
+                                        token = None;
+                                    }
+                                }
+                            } else {
+                                token = Token::parse(entry.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(Self {
             client: RegistryClient::new(token),
             uri: uri.clone(),
+            #[cfg(feature = "aws")]
+            is_public_ecr,
         })
     }
 
@@ -305,7 +311,25 @@ impl Registry {
 
     /// Get the list of tags in a repository on this registry
     pub(crate) async fn get_tags(&self, repository: &str) -> Result<Vec<String>> {
-        let response = self.client.get_tags(&self.url()?, repository).await?;
+        cfg_if! {
+            if #[cfg(feature = "aws")] {
+                let repository_name = if self.is_public_ecr {
+                    if let Some(precursor) = self.uri().base().split_once('/').map(|x| x.1) {
+                        format!("{}/{}", precursor, repository)
+                    } else {
+                        repository.to_string()
+                    }
+                } else {
+                    repository.to_string()
+                };
+            } else {
+                let repository_name = repository.to_string();
+            }
+        }
+        let response = self
+            .client
+            .get_tags(&self.url()?, repository_name.as_str())
+            .await?;
         trace!(target: "registry", "get_tags: {:?}", response);
         ensure!(
             response.status().is_success(),
@@ -317,7 +341,9 @@ impl Registry {
             }
         );
         let taglist: TagList = Self::body(response).await?;
-        Ok(taglist.tags)
+        let mut tags = taglist.tags.clone();
+        tags.sort();
+        Ok(tags)
     }
 
     /// Delete a tag in the registry in the given repository

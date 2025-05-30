@@ -58,6 +58,9 @@ pub enum Error {
     FetchIndex { reason: ErrorResponse },
     #[snafu(display("failed to fetch manifest: {reason}"))]
     FetchManifest { reason: ErrorResponse },
+    #[cfg(feature = "aws")]
+    #[snafu(display("failed to fetch tags from public ecr: {reason}"))]
+    FetchTagsAws { reason: String },
     #[snafu(display("failed to interact with local file: {source}"))]
     File { source: std::io::Error },
     #[snafu(display("failed to finish blob upload: {reason}"))]
