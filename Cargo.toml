@@ -1,0 +1,70 @@
+[package]
+name = "ocilot"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 or MIT"
+
+[features]
+default = ["aws", "progress", "compression"]
+aws = [
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:aws-sdk-ecr",
+    "dep:aws-sdk-ecrpublic",
+]
+compression = ["dep:async-compression"]
+progress = ["dep:indicatif", "dep:indicatif-log-bridge"]
+
+[dependencies]
+anyhow = "1.0"
+async-compression = { version = "0.4", features = [
+    "tokio",
+    "bzip2",
+    "gzip",
+    "lzma",
+    "xz",
+    "zstd",
+], optional = true }
+async-recursion = "1.1"
+async-trait = "0.1"
+aws-config = { version = "1.6", features = [
+    "rustls",
+    "rt-tokio",
+], optional = true }
+aws-credential-types = { version = "1.2", optional = true }
+aws-sdk-ecr = { version = "1.78", features = [
+    "rustls",
+    "rt-tokio",
+], optional = true }
+aws-sdk-ecrpublic = { version = "1.74", features = [
+    "rustls",
+    "rt-tokio",
+], optional = true }
+base16 = "0.2"
+base64 = "0.22"
+bytes = "1.10"
+cfg-if = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+derive_builder = "0.20"
+futures = "0.3"
+indicatif = { version = "0.17", optional = true }
+indicatif-log-bridge = { version = "0.2", optional = true }
+homedir = "0.3"
+keyring = "3.6"
+log = "0.4"
+reqwest = { version = "0.12", features = [
+    "json",
+    "rustls-tls",
+    "stream",
+], default-features = false }
+pretty_env_logger = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+snafu = "0.8"
+tempfile = "3.20"
+tokio = { version = "1.45", features = ["full"] }
+astral-tokio-tar = "0.5"
+tokio-util = "0.7"
+url = "2.5"
