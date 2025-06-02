@@ -31,7 +31,7 @@ pub struct Registry {
     /// Registry client to use
     pub(crate) client: RegistryClient,
     #[cfg(feature = "aws")]
-    is_public_ecr: bool,
+    is_ecr: bool,
 }
 
 unsafe impl Send for Registry {}
@@ -44,7 +44,7 @@ impl Registry {
         // First check our common auth files for an entry
         let mut token = None;
         #[cfg(feature = "aws")]
-        let mut is_public_ecr = false;
+        let mut is_ecr = false;
         // If we get here then we may want to try and utilize credential helpers for given registry types
         cfg_if! {
             if #[cfg(feature = "aws")] {
@@ -57,7 +57,7 @@ impl Registry {
                         .await
                         .map_err(|e| { error!("public ecr: {:?}", e); error::Error::Authorization { reason: e.to_string() } })?;
                     trace!(target: "registry", "public ecr authorization response: {:?}", ecr_response);
-                    is_public_ecr = true;
+                    is_ecr = true;
                     token = ecr_response.authorization_data()
                         .and_then(|x| x.authorization_token.clone()
                         .map(Token::Bearer));
@@ -65,6 +65,7 @@ impl Registry {
                     debug!(target: "registry", "using private ecr");
                     let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
                     let ecr_client = aws_sdk_ecr::Client::new(&sdk_config);
+                    is_ecr = true;
                     let ecr_response = ecr_client.get_authorization_token()
                         .send()
                         .await
@@ -129,7 +130,7 @@ impl Registry {
             client: RegistryClient::new(token),
             uri: uri.clone(),
             #[cfg(feature = "aws")]
-            is_public_ecr,
+            is_ecr,
         })
     }
 
@@ -146,6 +147,25 @@ impl Registry {
     /// Convert the registry uri into the url to call
     pub fn url(&self) -> crate::Result<Url> {
         self.uri.clone().try_into()
+    }
+
+    /// Get a ecr correct repository name
+    fn repository_name(&self, repository: &str) -> String {
+        cfg_if! {
+            if #[cfg(feature = "aws")] {
+                if self.is_ecr {
+                    if let Some(precursor) = self.uri().base().split_once('/').map(|x| x.1) {
+                        format!("{}/{}", precursor, repository)
+                    } else {
+                        repository.to_string()
+                    }
+                } else {
+                    repository.to_string()
+                }
+            } else {
+                repository.to_string()
+            }
+        }
     }
 
     // Fetch the catalog of repositories in the registry
@@ -167,6 +187,7 @@ impl Registry {
 
     /// Check for the existence of a blob in the registry
     pub(crate) async fn check_blob(&self, repository: &str, digest: &str) -> Result<bool> {
+        let repository = self.repository_name(repository);
         let response = self
             .client
             .clone()
@@ -185,6 +206,7 @@ impl Registry {
         impl Stream<Item = std::result::Result<Bytes, std::io::Error>>,
         u64,
     )> {
+        let repository = self.repository_name(repository);
         let response = self
             .client
             .clone()
@@ -214,6 +236,7 @@ impl Registry {
 
     /// Delete a blob from the registry
     pub(crate) async fn delete_blob(&self, repository: &str, digest: &str) -> Result<()> {
+        let repository = self.repository_name(repository);
         let response = self
             .client
             .del_blob(self.url()?, repository.into(), digest.into())
@@ -234,6 +257,7 @@ impl Registry {
 
     /// Check for the existence of a manifest in the registry
     pub(crate) async fn check_manifest(&self, repository: &str, reference: &str) -> Result<bool> {
+        let repository = self.repository_name(repository);
         let response = self
             .client
             .head_manifest(self.url()?, repository.into(), reference.into())
@@ -247,6 +271,7 @@ impl Registry {
     where
         T: DeserializeOwned,
     {
+        let repository = self.repository_name(repository);
         let response = self
             .client
             .get_manifest(self.url()?, repository.into(), reference.into())
@@ -276,6 +301,7 @@ impl Registry {
     where
         T: Serialize,
     {
+        let repository = self.repository_name(repository);
         let bytes = serde_json::to_vec(manifest).context(error::SerializeSnafu)?;
         let size = bytes.len();
         let hash = Sha256::digest(bytes.as_slice());
@@ -311,21 +337,7 @@ impl Registry {
 
     /// Get the list of tags in a repository on this registry
     pub(crate) async fn get_tags(&self, repository: &str) -> Result<Vec<String>> {
-        cfg_if! {
-            if #[cfg(feature = "aws")] {
-                let repository_name = if self.is_public_ecr {
-                    if let Some(precursor) = self.uri().base().split_once('/').map(|x| x.1) {
-                        format!("{}/{}", precursor, repository)
-                    } else {
-                        repository.to_string()
-                    }
-                } else {
-                    repository.to_string()
-                };
-            } else {
-                let repository_name = repository.to_string();
-            }
-        }
+        let repository_name = self.repository_name(repository);
         let response = self
             .client
             .get_tags(&self.url()?, repository_name.as_str())
@@ -348,6 +360,7 @@ impl Registry {
 
     /// Delete a tag in the registry in the given repository
     pub(crate) async fn delete_tag(&self, repository: &str, tag: &str) -> Result<()> {
+        let repository = self.repository_name(repository);
         let response = self
             .client
             .del_manifest(self.url()?, repository.into(), tag.into())
