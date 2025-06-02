@@ -1,9 +1,9 @@
-use anyhow::Context;
+use cfg_if::cfg_if;
 use indicatif::{MultiProgress, ProgressBar};
-use indicatif_log_bridge::LogWrapper;
 use std::pin::Pin;
 use std::task::Poll;
 use tokio::io::AsyncWrite;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 pub struct Ctx {
     multi: MultiProgress,
@@ -11,15 +11,26 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn init() -> anyhow::Result<Self> {
-        let logger = pretty_env_logger::formatted_builder()
-            .filter_level(log::LevelFilter::Info)
-            .build();
-        let level = logger.filter();
+        cfg_if! {
+            if #[cfg(feature = "progress")] {
+                let indicatif_layer = tracing_indicatif::IndicatifLayer::new();
+                tracing_subscriber::registry()
+                    .with(tracing_subscriber::fmt::layer()
+                        .with_writer(indicatif_layer.get_stdout_writer())
+                        .with_filter(EnvFilter::from_default_env())
+                    )
+                    .with(indicatif_layer.with_filter(EnvFilter::from_default_env()))
+                    .try_init()
+                    .unwrap();
+            } else {
+                tracing_subscriber::registry()
+                    .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_default_env()))
+                    .try_init()
+                    .unwrap();;
+
+            }
+        }
         let multi = MultiProgress::new();
-        LogWrapper::new(multi.clone(), logger)
-            .try_init()
-            .context("failed to initialize logger")?;
-        log::set_max_level(level);
         Ok(Self { multi })
     }
 

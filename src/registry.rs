@@ -11,7 +11,7 @@ use base64::Engine;
 use bytes::Bytes;
 use cfg_if::cfg_if;
 use futures::stream::{Stream, TryStreamExt};
-use homedir::my_home;
+use home::home_dir;
 use keyring::Entry;
 use reqwest::Response;
 use serde::de::DeserializeOwned;
@@ -85,7 +85,7 @@ impl Registry {
         if token.is_none() {
             // If a token hasn't been resolved try the keyring
             for file in COMMON_AUTH_FILES {
-                if let Ok(Some(path)) = my_home() {
+                if let Some(path) = home_dir() {
                     let path = path.join(file);
                     if path.exists() {
                         let auth = tokio::fs::read_to_string(path)

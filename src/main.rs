@@ -1,5 +1,5 @@
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 use crate::cmd::export::Export;
 use crate::cmd::pull::Pull;
