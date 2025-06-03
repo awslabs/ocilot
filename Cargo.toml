@@ -3,7 +3,7 @@ name = "ocilot"
 description = "cli and library for interacting with OCI registries"
 version = "0.1.0-beta.1"
 edition = "2021"
-license = "Apache-2.0 or MIT"
+license = "MIT OR Apache-2.0"
 
 [features]
 default = ["aws", "progress", "compression"]
