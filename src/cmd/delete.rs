@@ -1,12 +1,12 @@
 use clap::Parser;
 use ocilot::{
     error,
-    layer::LayerBuilder,
+    layer::Layer,
     models::MediaType,
     repository::Repository,
     uri::{Reference, Uri},
 };
-use snafu::{ensure, ResultExt};
+use snafu::ensure;
 
 use super::context::Ctx;
 
@@ -69,13 +69,11 @@ impl DeleteBlob {
             error::DeleteBlobNoDigestSnafu {}
         );
         let digest = uri.reference().to_string();
-        let layer = LayerBuilder::default()
+        let layer = Layer::builder()
             .media_type(MediaType::Manifest)
             .digest(digest)
             .size(0_usize)
-            .platform(None)
-            .build()
-            .context(error::LayerSnafu)?;
+            .build();
         layer.delete(&uri).await
     }
 }

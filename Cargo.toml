@@ -2,7 +2,7 @@
 name = "ocilot"
 description = "cli and library for interacting with OCI registries"
 version = "0.1.0-beta.2"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [features]
@@ -17,7 +17,6 @@ compression = ["dep:async-compression"]
 progress = ["dep:indicatif", "dep:tracing-indicatif"]
 
 [dependencies]
-anyhow = "1.0"
 async-compression = { version = "0.4", features = [
     "tokio",
     "bzip2",
@@ -44,29 +43,28 @@ aws-sdk-ecrpublic = { version = "1", default-features = false, features = [
 ], optional = true }
 base16 = "0.2"
 base64 = "0.22"
-bytes = "1.10"
+bon = "3"
+bytes = "1.11"
 cfg-if = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-derive_builder = "0.20"
 futures = "0.3"
-indicatif = { version = "0.17", optional = true }
+indicatif = { version = "0.18", optional = true }
 home = "0.5"
 keyring = "3.6"
-reqwest = { version = "0.12", features = [
+reqwest = { version = "0.13", features = [
     "json",
-    "rustls-tls",
     "stream",
-], default-features = false }
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-snafu = "0.8"
+sha2 = "0.11"
+snafu = "0.9"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-indicatif = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-astral-tokio-tar = "0.5"
+astral-tokio-tar = "0.6"
 url = "2"

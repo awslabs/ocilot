@@ -2,17 +2,17 @@ use crate::error;
 use crate::models::MediaType;
 use crate::models::Platform;
 use crate::uri::{Reference, Uri};
+use bon::Builder;
 use bytes::Bytes;
 use cfg_if::cfg_if;
-use derive_builder::Builder;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 #[cfg(feature = "progress")]
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use snafu::{ensure, ResultExt};
+use snafu::{ResultExt, ensure};
 use std::cmp::min;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -27,12 +27,15 @@ const MAX_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 /// A layer represents a blob or sub-object (like a image config) associated with an
 /// image. As such operations for reading or writing blobs operate off this object.
 #[derive(Debug, Serialize, Deserialize, Clone, Builder)]
-#[builder(setter(into))]
 #[serde(rename_all = "camelCase")]
 pub struct Layer {
+    #[builder(into)]
     media_type: MediaType,
+    #[builder(into)]
     size: usize,
+    #[builder(into)]
     digest: String,
+    #[builder(into)]
     #[serde(skip_serializing_if = "Option::is_none")]
     platform: Option<Platform>,
 }
@@ -205,9 +208,10 @@ impl Layer {
             matches!(uri.reference(), Reference::Digest { .. }),
             error::DirectLoadBlobSnafu { uri: uri.clone() }
         );
+        let digest = uri.reference().to_string();
         let (reader, _) = uri
             .registry()
-            .fetch_blob(uri.repository(), uri.reference().to_string().as_str())
+            .fetch_blob(uri.repository(), digest.as_str())
             .await?;
         Ok(Reader::new(StreamReader::new(reader)))
     }
@@ -300,10 +304,8 @@ impl AsyncRead for Reader {
             Poll::Ready(Ok(())) => {
                 cfg_if! {
                     if #[cfg(feature = "progress")] {
-                        if let Some(bar) = this.progress.as_mut() {
-                            if buf.remaining() == 0 {
-                                bar.inc(buf.filled().len() as u64);
-                            }
+                        if let Some(bar) = this.progress.as_mut() && buf.remaining() == 0 {
+                            bar.inc(buf.filled().len() as u64);
                         }
                     }
                 }

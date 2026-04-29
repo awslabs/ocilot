@@ -3,16 +3,13 @@ use std::str::FromStr;
 use super::context::Ctx;
 use clap::Parser;
 use futures::future::join_all;
-use ocilot::error;
-use ocilot::uri::UriBuilder;
 use ocilot::{
+    Result,
     image::Image,
     index::Index,
     layer::Layer,
     uri::{Reference, Uri},
-    Result,
 };
-use snafu::ResultExt;
 use tokio::task::JoinHandle;
 
 #[derive(Parser, Debug)]
@@ -35,20 +32,18 @@ impl Copy {
         let index = Index::fetch(&source).await?;
         let multi = ctx.get();
         for manifest in index.manifests().iter() {
-            let manifest_uri = UriBuilder::default()
+            let manifest_uri = Uri::builder()
                 .registry(source.registry().clone())
                 .repository(source.repository())
                 .reference(Reference::from_str(manifest.digest())?)
-                .build()
-                .context(error::UriSnafu)?;
+                .build();
             let image = Image::fetch(&manifest_uri, manifest.platform().clone()).await?;
             // Copy the config over, note we do not use progress bars for the read
-            let config_uri = UriBuilder::default()
+            let config_uri = Uri::builder()
                 .registry(target.registry().clone())
                 .repository(target.repository())
                 .reference(Reference::from_str(image.config().digest())?)
-                .build()
-                .context(error::UriSnafu)?;
+                .build();
             let digest = &image.config().digest().strip_prefix("sha256:").unwrap()[0..9];
             let mut writer = Layer::create_progress(
                 &config_uri,
@@ -91,12 +86,11 @@ impl Copy {
                 }));
             }
             join_all(tasks).await;
-            let target_manifest_uri = UriBuilder::default()
+            let target_manifest_uri = Uri::builder()
                 .registry(target.registry().clone())
                 .repository(target.repository())
                 .reference(Reference::from_str(manifest.digest())?)
-                .build()
-                .context(error::UriSnafu)?;
+                .build();
             image.push(&target_manifest_uri).await?;
         }
         // Now all images in index are copied push the index

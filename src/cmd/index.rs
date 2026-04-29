@@ -1,7 +1,6 @@
 use clap::Parser;
 use ocilot::error;
-use ocilot::index::IndexBuilder;
-use ocilot::layer::LayerBuilder;
+use ocilot::layer::Layer;
 use ocilot::models::Platform;
 use ocilot::uri::Reference;
 use ocilot::uri::Uri;
@@ -100,19 +99,18 @@ impl AddIndex {
         let image_bytes = serde_json::to_vec(&image).context(error::SerializeSnafu)?;
         let hash = Sha256::digest(image_bytes.as_slice());
         let digest = format!("sha256:{}", base16::encode_lower(hash.as_slice()));
-        let layer = LayerBuilder::default()
+        let layer = Layer::builder()
             .media_type(image.media_type().clone())
             .digest(digest.clone())
-            .build()
-            .context(error::LayerSnafu)?;
+            .size(image_bytes.len())
+            .build();
         let mut manifests = index.manifests().to_vec();
         manifests.push(layer);
-        let index = IndexBuilder::default()
+        let index = Index::builder()
             .schema_version(2_usize)
             .media_type(index.media_type().clone())
             .manifests(manifests)
-            .build()
-            .context(error::IndexSnafu)?;
+            .build();
         index.push(&target).await?;
 
         Ok(())

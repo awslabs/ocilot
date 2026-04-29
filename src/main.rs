@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate tracing;
-
 use crate::cmd::export::Export;
 use crate::cmd::pull::Pull;
 use clap::Parser;
@@ -32,8 +29,9 @@ enum Commands {
     Copy(Copy),
 }
 
+#[snafu::report]
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ocilot::Result<()> {
     let mut ctx = Ctx::init()?;
     let args = Args::parse();
 

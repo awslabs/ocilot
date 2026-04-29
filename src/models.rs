@@ -1,6 +1,6 @@
 use base64::Engine;
+use bon::Builder;
 use chrono::{DateTime, Utc};
-use derive_builder::Builder;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::env::consts;
@@ -152,19 +152,22 @@ impl Compression {
 /// an image that docker/podman/finch/nerdctl can use load on.
 #[derive(Builder, Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-#[builder(setter(into))]
 pub struct TarballManifest {
+    #[builder(into)]
     pub config: String,
+    #[builder(into)]
     pub repo_tags: Vec<String>,
+    #[builder(into)]
     pub layers: Vec<String>,
 }
 
 /// Represents the frequently used platform identifiers both in json format and as the
 /// commandline <os>/<architecture> format.
 #[derive(Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[builder(setter(into))]
 pub struct Platform {
+    #[builder(into)]
     pub architecture: String,
+    #[builder(into)]
     pub os: String,
 }
 
@@ -200,20 +203,26 @@ impl fmt::Display for Platform {
 /// Represents the config block inside of an image config and frequently utilized fields
 #[derive(Builder, Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
-#[builder(setter(into))]
 pub struct Config {
+    #[builder(into)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[builder(into)]
     #[serde(default)]
     pub env: Vec<String>,
+    #[builder(into)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cmd: Vec<String>,
+    #[builder(into)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    #[builder(into)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_build: Option<String>,
+    #[builder(into)]
     #[serde(default)]
     pub args_escaped: bool,
+    #[builder(into)]
     #[serde(default)]
     pub labels: HashMap<String, String>,
 }
@@ -221,11 +230,14 @@ pub struct Config {
 /// Represents a history log entry in an image config
 #[derive(Builder, Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
-#[builder(setter(into))]
 pub struct History {
+    #[builder(into)]
     pub created: DateTime<Utc>,
+    #[builder(into)]
     pub created_by: String,
+    #[builder(into)]
     pub comment: String,
+    #[builder(into)]
     #[serde(default)]
     pub empty_layer: bool,
 }
@@ -233,12 +245,16 @@ pub struct History {
 /// Represents the shape of an image configuration blob
 #[derive(Builder, Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[builder(setter(into))]
 pub struct ImageConfig {
+    #[builder(into)]
     pub architecture: String,
+    #[builder(into)]
     pub config: Config,
+    #[builder(into)]
     pub created: DateTime<Utc>,
+    #[builder(into)]
     pub history: Vec<History>,
+    #[builder(into)]
     pub os: String,
 }
 

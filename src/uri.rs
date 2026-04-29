@@ -1,4 +1,4 @@
-use derive_builder::Builder;
+use bon::Builder;
 use snafu::{OptionExt, ResultExt};
 use std::fmt;
 use std::fmt::Formatter;
@@ -11,23 +11,26 @@ use crate::registry::Registry;
 /// Represents a reference to an object in an oci
 /// container.
 #[derive(Debug, Clone, Builder)]
-#[builder(setter(into))]
 pub struct Uri {
     /// Registry this object is stored in
+    #[builder(into)]
     registry: Registry,
     /// Repository this object is categorized under
+    #[builder(into)]
     repository: String,
     /// Reference to the object usually a tag ':tag' or digest '@digest'
+    #[builder(into)]
     reference: Reference,
 }
 
 /// Uri to a specific registry
 #[derive(Debug, Clone, Builder)]
-#[builder(setter(into))]
 pub struct RegistryUri {
     /// Registry url
+    #[builder(into)]
     base: String,
     /// Whether to connect with https or not
+    #[builder(into)]
     is_secure: bool,
 }
 

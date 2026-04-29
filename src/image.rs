@@ -2,15 +2,15 @@
 use crate::compression::Decompress;
 use crate::error;
 use crate::layer::Layer;
-use crate::models::{Config, ImageConfig, MediaType, Platform, TarballManifestBuilder};
+use crate::models::{Config, ImageConfig, MediaType, Platform, TarballManifest};
 use crate::uri::{Reference, Uri};
-use derive_builder::Builder;
-use futures::future::join_all;
+use bon::Builder;
 use futures::StreamExt;
+use futures::future::join_all;
 #[cfg(feature = "progress")]
 use indicatif::MultiProgress;
 use serde::{Deserialize, Serialize};
-use snafu::{ensure, ResultExt};
+use snafu::{ResultExt, ensure};
 use std::collections::HashSet;
 use tempfile::tempdir;
 use tokio::fs::File;
@@ -23,13 +23,17 @@ const WHITEOUT: &str = ".wh.";
 /// Represents a single Image or Manifest object in an OCI registry + repository
 /// all operations working with a single image work with this type.
 #[derive(Debug, Serialize, Deserialize, Clone, Builder)]
-#[builder(setter(into))]
 #[serde(rename_all = "camelCase")]
 pub struct Image {
+    #[builder(into)]
     schema_version: usize,
+    #[builder(into)]
     media_type: MediaType,
+    #[builder(into)]
     config: Layer,
+    #[builder(into)]
     layers: Vec<Layer>,
+    #[builder(into)]
     #[serde(skip)]
     platform: Option<Platform>,
 }
@@ -203,12 +207,11 @@ impl Image {
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mut manifest = TarballManifestBuilder::default()
+        let mut manifest = TarballManifest::builder()
             .config(self.config.digest())
             .repo_tags(vec![uri.to_string()])
             .layers(vec![])
-            .build()
-            .context(error::TarballManifestSnafu)?;
+            .build();
         let tmp_dir = tempdir().context(error::TempSnafu)?;
         let mut config_reader = self.config.open(uri).await?;
         let mut config_file = File::create(tmp_dir.path().join(self.config.digest()))
@@ -267,12 +270,11 @@ impl Image {
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mut manifest = TarballManifestBuilder::default()
+        let mut manifest = TarballManifest::builder()
             .config(self.config.digest())
             .repo_tags(vec![uri.to_string()])
             .layers(vec![])
-            .build()
-            .context(error::TarballManifestSnafu)?;
+            .build();
         let tmp_dir = tempdir().context(error::TempSnafu)?;
         let mut config_reader = self.config.open_progress(uri, progress).await?;
         let mut config_file = File::create(tmp_dir.path().join(self.config.digest()))

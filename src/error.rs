@@ -5,10 +5,8 @@ use snafu::Snafu;
 use tokio::task::JoinError;
 use url::Url;
 
-use crate::index::IndexBuilderError;
-use crate::layer::LayerBuilderError;
-use crate::models::{ErrorResponse, Platform, TarballManifestBuilderError};
-use crate::uri::{Uri, UriBuilderError};
+use crate::models::{ErrorResponse, Platform};
+use crate::uri::Uri;
 
 #[derive(Snafu, Debug)]
 #[snafu(visibility(pub))]
@@ -19,9 +17,7 @@ pub enum Error {
     Authorization { reason: String },
     #[snafu(display("blob with digest {digest} is missing from oci archive"))]
     BlobMissing { digest: String },
-    #[snafu(display(
-        "failed to deserialize image configuration received from registry: {source}"
-    ))]
+    #[snafu(display("failed to deserialize image configuration received from registry: {source}"))]
     ConfigDeserialize { source: serde_json::Error },
     #[snafu(display("oci registry did not return the content length"))]
     ContentLengthMissing,
@@ -29,8 +25,6 @@ pub enum Error {
     ContentLengthNotNumber { source: ParseIntError },
     #[snafu(display("oci registry did not return a proper header"))]
     ImproperHeader { source: ToStrError },
-    #[snafu(display("failed to build image index: {source}"))]
-    Index { source: IndexBuilderError },
     #[snafu(display("failed to deserialize response body: {source}"))]
     BodyDeserialize { source: serde_json::Error },
     #[snafu(display("failed to delete blob '{digest}': {reason}"))]
@@ -77,8 +71,6 @@ pub enum Error {
     ImageNotValid,
     #[snafu(display("invalid algorithm in digest: {algorithm}"))]
     InvalidAlgorithm { algorithm: String },
-    #[snafu(display("invalid layer definition: {source}"))]
-    Layer { source: LayerBuilderError },
     #[snafu(display("failed to unpack archive from layer: {source}"))]
     LayerArchive { source: std::io::Error },
     #[snafu(display("failed to copy from layer: {source}"))]
@@ -109,14 +101,10 @@ pub enum Error {
     StartBlobUpload { reason: ErrorResponse },
     #[snafu(display("registry did not provide an upload_url for blob upload"))]
     StartBlobNoLocation,
-    #[snafu(display("failed to construct manifest for tarball export: {source}"))]
-    TarballManifest { source: TarballManifestBuilderError },
     #[snafu(display("failed to create temporary directory: {source}"))]
     Temp { source: std::io::Error },
     #[snafu(display("upload of chunk for blob failed: {reason}"))]
     Upload { reason: ErrorResponse },
     #[snafu(display("invalid url detected: {source}"))]
     Url { source: url::ParseError },
-    #[snafu(display("invalid object uri: {source}"))]
-    Uri { source: UriBuilderError },
 }

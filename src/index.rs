@@ -5,26 +5,28 @@ use crate::image::Image;
 use crate::layer::Layer;
 use crate::models::MediaType;
 use crate::models::Platform;
-use crate::uri::{Reference, Uri, UriBuilder};
-use derive_builder::Builder;
+use crate::uri::{Reference, Uri};
+use bon::Builder;
 use futures::future::join_all;
 #[cfg(feature = "progress")]
 use indicatif::MultiProgress;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 use tempfile::tempdir;
-use tokio::fs::{create_dir_all, File};
+use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncWrite;
 use tokio::task::JoinHandle;
 use tokio_tar::Builder as ArchiveBuilder;
 
 /// Represents an Image Index and handles all operations that require or utilize one
 #[derive(Debug, Serialize, Deserialize, Clone, Builder)]
-#[builder(setter(into))]
 #[serde(rename_all = "camelCase")]
 pub struct Index {
+    #[builder(into)]
     schema_version: usize,
+    #[builder(into)]
     media_type: MediaType,
+    #[builder(into)]
     manifests: Vec<Layer>,
 }
 
@@ -86,12 +88,11 @@ impl Index {
                     platform: platform.clone(),
                 })?;
             // Use the digest
-            let new_uri = UriBuilder::default()
+            let new_uri = Uri::builder()
                 .registry(uri.registry().clone())
                 .repository(uri.repository())
                 .reference(Reference::from_str(oci.digest())?)
-                .build()
-                .context(error::UriSnafu)?;
+                .build();
             Ok(Some(Image::fetch(&new_uri, Some(platform)).await?))
         } else {
             // See if we can match by architecture
@@ -102,23 +103,21 @@ impl Index {
                 .find(|x| x.platform() == Some(current.clone()))
             {
                 // Use the digest
-                let new_uri = UriBuilder::default()
+                let new_uri = Uri::builder()
                     .registry(uri.registry().clone())
                     .repository(uri.repository())
                     .reference(Reference::from_str(oci.digest())?)
-                    .build()
-                    .context(error::UriSnafu)?;
+                    .build();
                 return Ok(Some(Image::fetch(&new_uri, Some(current.clone())).await?));
             }
             // Otherwise we return the first image
             if let Some(oci) = self.manifests.first() {
                 // Use the digest
-                let new_uri = UriBuilder::default()
+                let new_uri = Uri::builder()
                     .registry(uri.registry().clone())
                     .repository(uri.repository())
                     .reference(Reference::from_str(oci.digest())?)
-                    .build()
-                    .context(error::UriSnafu)?;
+                    .build();
                 Ok(Some(Image::fetch(&new_uri, oci.platform().clone()).await?))
             } else {
                 Ok(None)
@@ -185,12 +184,11 @@ impl Index {
 
         // Now for every manifest we are working with we need to store it out
         for manifest in index.manifests.iter() {
-            let image_uri = UriBuilder::default()
+            let image_uri = Uri::builder()
                 .registry(uri.registry().clone())
                 .repository(uri.repository())
                 .reference(Reference::from_str(manifest.digest())?)
-                .build()
-                .context(error::UriSnafu)?;
+                .build();
             let image = Image::fetch(&image_uri, manifest.platform().clone()).await?;
             // Write the image manifest as a blob
             let manifest_bytes = serde_json::to_string(&image).context(error::SerializeSnafu)?;
@@ -288,12 +286,11 @@ impl Index {
 
         // Now for every manifest we are working with we need to store it out
         for manifest in index.manifests.iter() {
-            let image_uri = UriBuilder::default()
+            let image_uri = Uri::builder()
                 .registry(uri.registry().clone())
                 .repository(uri.repository())
                 .reference(Reference::from_str(manifest.digest())?)
-                .build()
-                .context(error::UriSnafu)?;
+                .build();
             let image = Image::fetch(&image_uri, manifest.platform().clone()).await?;
             // Write the image manifest as a blob
             let manifest_bytes = serde_json::to_string(&image).context(error::SerializeSnafu)?;

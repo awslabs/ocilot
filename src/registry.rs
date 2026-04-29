@@ -1,10 +1,10 @@
 use crate::client::RegistryClient;
-use crate::layer::{Layer, LayerBuilder};
+use crate::layer::Layer;
 use crate::models::{
     DockerConfig, ErrorResponse, MediaType, Platform, RepositoryList, TagList, Token,
 };
 use crate::uri::RegistryUri;
-use crate::{error, Result};
+use crate::{Result, error};
 #[cfg(feature = "aws")]
 use aws_config::BehaviorVersion;
 use base64::Engine;
@@ -14,10 +14,10 @@ use futures::stream::{Stream, TryStreamExt};
 use home::home_dir;
 use keyring::Entry;
 use reqwest::Response;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use url::Url;
 
 const COMMON_AUTH_FILES: &[&str] = &[".finch/config.json", ".docker/config.json"];
@@ -191,7 +191,7 @@ impl Registry {
         let response = self
             .client
             .clone()
-            .head_blob(self.url()?, repository.into(), digest.into())
+            .head_blob(self.url()?, repository, digest.into())
             .await?;
         trace!(target: "registry", "head_blob: {:?}", response);
         Ok(response.status().is_success())
@@ -203,14 +203,14 @@ impl Registry {
         repository: &str,
         digest: &str,
     ) -> Result<(
-        impl Stream<Item = std::result::Result<Bytes, std::io::Error>>,
+        impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + use<>,
         u64,
     )> {
         let repository = self.repository_name(repository);
         let response = self
             .client
             .clone()
-            .get_blob(self.url()?, repository.into(), digest.into())
+            .get_blob(self.url()?, repository, digest.into())
             .await?;
         trace!(target: "registry", "get_blob: {:?}", response);
         ensure!(
@@ -239,7 +239,7 @@ impl Registry {
         let repository = self.repository_name(repository);
         let response = self
             .client
-            .del_blob(self.url()?, repository.into(), digest.into())
+            .del_blob(self.url()?, repository, digest.into())
             .await?;
         trace!(target: "registry", "del_blob: {:?}", response);
         ensure!(
@@ -260,7 +260,7 @@ impl Registry {
         let repository = self.repository_name(repository);
         let response = self
             .client
-            .head_manifest(self.url()?, repository.into(), reference.into())
+            .head_manifest(self.url()?, repository, reference.into())
             .await?;
         trace!(target: "registry", "head_manifest: {:?}", response);
         Ok(response.status().is_success())
@@ -274,7 +274,7 @@ impl Registry {
         let repository = self.repository_name(repository);
         let response = self
             .client
-            .get_manifest(self.url()?, repository.into(), reference.into())
+            .get_manifest(self.url()?, repository, reference.into())
             .await?;
         trace!(target: "registry", "get_manifest: {:?}", response);
         ensure!(
@@ -310,7 +310,7 @@ impl Registry {
             .client
             .put_manifest(
                 self.url()?,
-                repository.into(),
+                repository,
                 reference.into(),
                 Bytes::from_owner(bytes),
             )
@@ -326,13 +326,12 @@ impl Registry {
                     .context(error::ErrorDeserializeSnafu)?
             }
         );
-        LayerBuilder::default()
+        Ok(Layer::builder()
             .digest(digest.clone())
             .media_type(media_type.clone())
             .size(size)
-            .platform(platform)
-            .build()
-            .context(error::LayerSnafu)
+            .maybe_platform(platform)
+            .build())
     }
 
     /// Get the list of tags in a repository on this registry
@@ -363,7 +362,7 @@ impl Registry {
         let repository = self.repository_name(repository);
         let response = self
             .client
-            .del_manifest(self.url()?, repository.into(), tag.into())
+            .del_manifest(self.url()?, repository, tag.into())
             .await?;
         trace!(target: "registry", "del_tag: {:?}", response);
         ensure!(

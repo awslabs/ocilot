@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use ocilot::index::Index;
 use ocilot::uri::Uri;
-use ocilot::{error, Result};
+use ocilot::{Result, error};
 use snafu::{OptionExt, ResultExt};
 use std::path::PathBuf;
 

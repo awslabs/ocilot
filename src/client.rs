@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::models::Token;
-use crate::{error, Result};
+use crate::{Result, error};
 use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::{RequestBuilder, Response};
@@ -54,7 +54,7 @@ pub(crate) trait RegistryClientImpl: Send + Sync + Debug {
     ) -> Result<Response>;
     /// HEAD {uri}/v2/{repository}/manifests/{reference}
     async fn head_manifest(&self, uri: &Url, repository: &str, reference: &str)
-        -> Result<Response>;
+    -> Result<Response>;
     /// GET {uri}/v2/{repository}/manifests/{reference}
     async fn get_manifest(&self, uri: &Url, repository: &str, reference: &str) -> Result<Response>;
     /// PUT {uri}/v2/{repository}/manifests/{reference}

@@ -3,14 +3,14 @@ use std::str::FromStr;
 
 use async_recursion::async_recursion;
 use clap::Parser;
-use futures::future::join_all;
 use futures::StreamExt;
+use futures::future::join_all;
 use ocilot::error;
 use ocilot::image::Image;
 use ocilot::index::Index;
 use ocilot::layer::Layer;
 use ocilot::models::MediaType;
-use ocilot::uri::{Reference, Uri, UriBuilder};
+use ocilot::uri::{Reference, Uri};
 use snafu::{OptionExt, ResultExt};
 use std::io::SeekFrom;
 use tokio::io::AsyncSeekExt;
@@ -124,12 +124,11 @@ impl Push {
                 let result = result.expect("failed to join");
                 result?;
             }
-            let manifest_uri = UriBuilder::default()
+            let manifest_uri = Uri::builder()
                 .registry(uri.registry().clone())
                 .repository(uri.repository())
                 .reference(Reference::from_str(manifest.digest())?)
-                .build()
-                .context(error::UriSnafu)?;
+                .build();
             image.push(&manifest_uri).await?;
         }
         // Now that all the layers are uploaded we can push the image
