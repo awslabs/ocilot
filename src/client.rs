@@ -9,8 +9,9 @@ use reqwest::{RequestBuilder, Response};
 use snafu::ResultExt;
 use url::Url;
 
-/// A trait for a client implementing requests to an oci registry. This is primarily implemented
-/// to allow for ease of unittesting this crate.
+/// A trait for a client implementing requests to an oci registry.
+///
+/// This is primarily implemented to allow for ease of unittesting this crate.
 #[async_trait]
 pub(crate) trait RegistryClientImpl: Send + Sync + Debug {
     /// GET {uri}/v2/_catalog
@@ -264,7 +265,10 @@ impl RegistryClientImpl for SimpleRegistryClient {
     }
 }
 
-/// Handle to a registry client. This primarily is utilized as an intercept point for unittesting
+/// Handle to OCI registry HTTP operations.
+///
+/// Wraps the underlying client implementation to enable dependency injection
+/// and unit testing.
 #[derive(Clone, Debug)]
 pub struct RegistryClient {
     client: Arc<dyn RegistryClientImpl>,

@@ -8,12 +8,14 @@ use cmd::{
 
 mod cmd;
 
+/// CLI argument parser.
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(subcommand)]
     command: Commands,
 }
 
+/// Available CLI subcommands.
 #[derive(Parser, Debug)]
 enum Commands {
     Index(IndexCmd),

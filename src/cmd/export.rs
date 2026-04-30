@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use super::context::Ctx;
 
+/// Export filesystem of a container image as a tarball.
 #[derive(Parser, Debug)]
 #[command(version, about = "Export filesystem of a container image as a tarball", long_about = None)]
 pub struct Export {

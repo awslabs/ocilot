@@ -1,14 +1,15 @@
 use crate::registry::Registry;
 
-/// Represents a single repository in a registry and handles
-/// all repository wide operations
+/// Represents a single repository in a registry.
+///
+/// Handles all repository-wide operations.
 pub struct Repository {
-    pub registry: Registry,
-    pub name: String,
+    registry: Registry,
+    name: String,
 }
 
 impl Repository {
-    /// Create a handler to a given repository in a registry
+    /// Create a handler to a given repository in a registry.
     pub fn new(registry: &Registry, name: &str) -> Self {
         Self {
             registry: registry.clone(),
@@ -16,12 +17,22 @@ impl Repository {
         }
     }
 
-    /// List all the tags in this repository
+    /// The registry this repository belongs to.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// The name of this repository.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// List all the tags in this repository.
     pub async fn tags(&self) -> crate::Result<Vec<String>> {
         self.registry.get_tags(self.name.as_str()).await
     }
 
-    /// Delete a tag in this repository
+    /// Delete a tag in this repository.
     pub async fn delete_tag(&self, tag: &str) -> crate::Result<()> {
         self.registry.delete_tag(&self.name, tag).await
     }

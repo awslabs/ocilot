@@ -8,8 +8,7 @@ use url::Url;
 use crate::error;
 use crate::registry::Registry;
 
-/// Represents a reference to an object in an oci
-/// container.
+/// Represents a reference to an object in an OCI container.
 #[derive(Debug, Clone, Builder)]
 pub struct Uri {
     /// Registry this object is stored in
@@ -23,7 +22,7 @@ pub struct Uri {
     reference: Reference,
 }
 
-/// Uri to a specific registry
+/// URI to a specific registry.
 #[derive(Debug, Clone, Builder)]
 pub struct RegistryUri {
     /// Registry url
@@ -141,7 +140,7 @@ impl fmt::Display for Uri {
     }
 }
 
-/// Represents a reference to a specific object via a tag or digest
+/// A reference to an object, either by tag or digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reference {
     Tag(String),
@@ -164,6 +163,7 @@ impl FromStr for Reference {
     }
 }
 
+/// Hash algorithm used in digest references.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Algorithm {
     #[default]

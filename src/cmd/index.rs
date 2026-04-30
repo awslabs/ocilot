@@ -11,6 +11,7 @@ use snafu::ResultExt;
 
 use super::context::Ctx;
 
+/// Manage image indexes.
 #[derive(Parser, Debug)]
 #[command(version, about = "Commands to interact with an image index", long_about = None)]
 pub struct IndexCmd {
@@ -18,6 +19,7 @@ pub struct IndexCmd {
     command: IndexCommands,
 }
 
+/// Index subcommands.
 #[derive(Parser, Debug)]
 pub enum IndexCommands {
     Get(GetIndex),
@@ -33,6 +35,7 @@ impl IndexCmd {
     }
 }
 
+/// Get an image index from a registry.
 #[derive(Parser, Debug)]
 #[command(version, about = "Get the index of an image", long_about = None)]
 pub struct GetIndex {
@@ -54,6 +57,7 @@ impl GetIndex {
     }
 }
 
+/// Add a manifest to an image index.
 #[derive(Parser, Debug)]
 #[command(version, about = "Create or add to image index in oci registry", long_about = None)]
 pub struct AddIndex {

@@ -9,6 +9,7 @@ use ocilot::uri::RegistryUri;
 
 use super::context::Ctx;
 
+/// List tags in a repository.
 #[derive(Parser, Debug)]
 #[clap(version, about = "List the tags in a repo", long_about = None)]
 pub struct List {

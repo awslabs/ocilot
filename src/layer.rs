@@ -19,13 +19,14 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_util::io::StreamReader;
 
-/// Minimum chunk size for network operations
+/// Minimum chunk size for layer operations (5 MiB).
 const MIN_CHUNK_SIZE: usize = 5 * 1024 * 1024;
-/// Maximum chunk size for network operations
-const MAX_CHUNK_SIZE: usize = 128 * 1024 * 1024;
+/// Maximum chunk size for layer operations (100 MiB).
+const MAX_CHUNK_SIZE: usize = 100 * 1024 * 1024;
 
-/// A layer represents a blob or sub-object (like a image config) associated with an
-/// image. As such operations for reading or writing blobs operate off this object.
+/// A layer represents a blob or sub-object associated with an image.
+///
+/// Operations for reading or writing blobs operate off this object.
 #[derive(Debug, Serialize, Deserialize, Clone, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct Layer {
@@ -41,10 +42,12 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// Perform a chunked copy of a layer from one reader to another. Any time you want to interact with a
-    /// layer in a registry, it is recommended to use this method. While most OCI registry implementations do not
-    /// need special handling to make the chunks of data sent uniform, certain implementations (i.e. ECR) work better when
-    /// using more uniform chunked operations.
+    /// Perform a chunked copy of a layer from one reader to another.
+    ///
+    /// Any time you want to interact with a layer in a registry, it is recommended
+    /// to use this method. While most OCI registry implementations do not need special
+    /// handling to make the chunks of data sent uniform, certain implementations
+    /// (i.e. ECR) work better when using more uniform chunked operations.
     pub async fn copy<'a, R, W>(
         reader: &'a mut R,
         writer: &'a mut W,
@@ -244,10 +247,10 @@ impl Layer {
     }
 }
 
-/// Reader implements a layer AsyncRead implementation that
-/// automatically will report to a progress bar if provided
-/// and the progress feature is enabled. It optionally can also
-/// automatically decompress the contents of the reader
+/// Layer `AsyncRead` implementation with optional progress reporting.
+///
+/// Automatically reports to a progress bar if provided and the progress
+/// feature is enabled. It can also decompress the contents of the reader.
 pub struct Reader {
     inner: Pin<Box<dyn AsyncRead>>,
     #[cfg(feature = "progress")]
@@ -317,9 +320,10 @@ impl AsyncRead for Reader {
     }
 }
 
-/// Implementation of AsyncWrite that writes a blob to a registry. This implementation
-/// will automatically handle using chunked upload versus single upload based on the size
-/// of the blob. Construction of this type is done by the Layer create methods.
+/// `AsyncWrite` implementation that writes a blob to a registry.
+///
+/// Automatically handles chunked upload versus single upload based on the
+/// size of the blob. Construction of this type is done by the Layer create methods.
 pub struct Writer {
     uri: Uri,
 
@@ -333,6 +337,7 @@ pub struct Writer {
     active: Option<Operation>,
 }
 
+/// Represents the current state of an async write operation.
 enum Operation {
     Error(BoxFuture<'static, Result<Bytes, reqwest::Error>>),
     Start(BoxFuture<'static, crate::Result<Response>>),

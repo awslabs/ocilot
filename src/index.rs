@@ -40,9 +40,11 @@ impl Index {
         }
     }
 
-    /// Check if their is an image index at the provided uri.
-    /// Note: This only checks that a manifest exists so it could return a false positive
-    /// as it does not verify the media type of the manifest to ensure it is an index
+    /// Check if there is an image index at the provided URI.
+    ///
+    /// Note: This only checks that a manifest exists so it could return a false
+    /// positive as it does not verify the media type of the manifest to ensure
+    /// it is an index.
     pub async fn check(uri: &Uri) -> crate::Result<bool> {
         uri.registry()
             .check_manifest(uri.repository(), uri.reference().to_string().as_str())
@@ -71,9 +73,11 @@ impl Index {
         self.manifests.as_slice()
     }
 
-    /// Fetch an image in this index if a platform is provided it will look for the first matching image with the platform.
-    /// If a platform is not provided it will either load an image matching the platform matching the current running environment or
-    /// the first image in the index
+    /// Fetch an image from this index.
+    ///
+    /// If a platform is provided, looks for the first matching image. If not
+    /// provided, loads an image matching the current running environment or
+    /// the first image in the index.
     pub async fn fetch_image(
         &self,
         uri: &Uri,

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use super::context::Ctx;
 
+/// Pull remote images and store locally as an archive.
 #[derive(Parser, Debug)]
 #[command(version, about = "Pull remote images by reference and store their contents locally as an archive", long_about = None)]
 pub struct Pull {
@@ -20,6 +21,7 @@ pub struct Pull {
     format: Format,
 }
 
+/// Output archive format.
 #[derive(Default, PartialEq, Eq, Debug, Clone, ValueEnum)]
 enum Format {
     #[default]

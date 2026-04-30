@@ -8,6 +8,7 @@ use ocilot::uri::RegistryUri;
 
 use super::context::Ctx;
 
+/// List repositories in a registry.
 #[derive(Parser, Debug)]
 #[clap(version, about = "List the repos in a registry", long_about = None)]
 pub struct Catalog {

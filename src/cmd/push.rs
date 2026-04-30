@@ -20,6 +20,7 @@ use tokio_tar::{Archive, Entry};
 
 use super::context::Ctx;
 
+/// Push an OCI archive to a registry.
 #[derive(Parser, Debug)]
 #[command(version, about = "Push an oci archive to repo", long_about = None)]
 pub struct Push {
@@ -161,6 +162,7 @@ where
     Ok(None)
 }
 
+/// Find the root index from an OCI archive.
 #[async_recursion]
 async fn find_index<'a>(archive: &'a mut File, index: &Index) -> Result<Index, error::Error> {
     for manifest in index.manifests().iter() {

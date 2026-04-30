@@ -2,6 +2,7 @@ use cfg_if::cfg_if;
 use indicatif::MultiProgress;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Application context passed through command execution.
 pub struct Ctx {
     multi: MultiProgress,
 }

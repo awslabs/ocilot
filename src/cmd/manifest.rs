@@ -7,6 +7,7 @@ use snafu::ResultExt;
 
 use super::context::Ctx;
 
+/// Inspect a manifest from a registry.
 #[derive(Parser, Debug)]
 #[command(version, about = "Get the manifest of an image", long_about = None)]
 pub struct Manifest {
