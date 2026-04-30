@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/awslabs/ocilot/compare/v0.1.0-beta.2...v0.1.0) - 2026-04-30
+
+### Fixed
+
+- Improve doc comment formatting and remove review artifacts
+- Update documentation and styling
+- ECR repository names for both private and public
+- Public ECR list tags operation
+
+### Changed
+
+- Update dependencies, fix edition and migrate to bon
+
+### Other
+
+- Initial open source release
+
 ## [0.1.0-beta.2](https://github.com/awslabs/ocilot/compare/v0.1.0-beta.1...v0.1.0-beta.2) - 2025-06-03
 
 ### Other

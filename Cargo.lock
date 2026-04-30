@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "ocilot"
-version = "0.1.0-beta.2"
+version = "0.1.0"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
