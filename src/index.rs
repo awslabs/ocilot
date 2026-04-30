@@ -18,7 +18,7 @@ use tokio::io::AsyncWrite;
 use tokio::task::JoinHandle;
 use tokio_tar::Builder as ArchiveBuilder;
 
-/// Represents an Image Index and handles all operations that require or utilize one
+/// Represents an Image Index and handles all operations that require or utilize one.
 #[derive(Debug, Serialize, Deserialize, Clone, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct Index {

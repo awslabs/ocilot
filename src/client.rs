@@ -9,9 +9,9 @@ use reqwest::{RequestBuilder, Response};
 use snafu::ResultExt;
 use url::Url;
 
-/// A trait for a client implementing requests to an oci registry.
+/// A trait for a client implementing requests to an OCI registry.
 ///
-/// This is primarily implemented to allow for ease of unittesting this crate.
+/// This is primarily implemented to allow for ease of unit testing this crate.
 #[async_trait]
 pub(crate) trait RegistryClientImpl: Send + Sync + Debug {
     /// GET {uri}/v2/_catalog

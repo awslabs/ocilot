@@ -1,10 +1,8 @@
 use clap::Parser;
 use snafu::{OptionExt, ResultExt};
-
 use ocilot::error;
 use ocilot::index::Index;
 use ocilot::uri::Uri;
-
 use super::context::Ctx;
 
 #[derive(Parser, Debug)]

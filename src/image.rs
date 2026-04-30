@@ -20,8 +20,9 @@ use tokio_tar::{Archive, Builder as ArchiveBuilder};
 
 const WHITEOUT: &str = ".wh.";
 
-/// Represents a single Image or Manifest object in an OCI registry + repository
-/// all operations working with a single image work with this type.
+/// Represents a single Image or Manifest object in an OCI registry + repository.
+///
+/// All operations working with a single image work with this type.
 #[derive(Debug, Serialize, Deserialize, Clone, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct Image {

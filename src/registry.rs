@@ -23,7 +23,8 @@ use url::Url;
 const COMMON_AUTH_FILES: &[&str] = &[".finch/config.json", ".docker/config.json"];
 
 /// Represents a client to a specific OCI registry.
-/// Most requests will go through this structure
+///
+/// Most requests will go through this structure.
 #[derive(Clone, Debug)]
 pub struct Registry {
     /// URI of the registry
