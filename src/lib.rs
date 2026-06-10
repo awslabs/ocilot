@@ -5,6 +5,8 @@ pub(crate) mod client;
 /// Layer decompression utilities.
 #[cfg(feature = "compression")]
 pub mod compression;
+/// Digest representation and parsing.
+pub mod digest;
 /// Error types for the crate.
 pub mod error;
 /// Image manifest handling.
@@ -15,6 +17,8 @@ pub mod index;
 pub mod layer;
 /// OCI specification model types.
 pub mod models;
+/// Optional progress reporting trait.
+pub mod progress;
 /// Registry client and operations.
 pub mod registry;
 /// Repository operations.

@@ -13,8 +13,32 @@ use crate::uri::Uri;
 pub enum Error {
     #[snafu(display("failed to interact with tar archive: {source}"))]
     Archive { source: std::io::Error },
-    #[snafu(display("failed to authorize with oci registry: {reason}"))]
-    Authorization { reason: String },
+    #[cfg(feature = "aws")]
+    #[snafu(display("failed to authorize with public ecr: {source}"))]
+    EcrPublicAuth {
+        source: aws_sdk_ecrpublic::error::SdkError<
+            aws_sdk_ecrpublic::operation::get_authorization_token::GetAuthorizationTokenError,
+        >,
+    },
+    #[cfg(feature = "aws")]
+    #[snafu(display("failed to authorize with private ecr: {source}"))]
+    EcrPrivateAuth {
+        source: aws_sdk_ecr::error::SdkError<
+            aws_sdk_ecr::operation::get_authorization_token::GetAuthorizationTokenError,
+        >,
+    },
+    #[snafu(display("{context}: invalid base64 in credential: {source}"))]
+    AuthBase64Decode {
+        context: &'static str,
+        source: base64::DecodeError,
+    },
+    #[snafu(display("{context}: credential payload is not valid utf-8: {source}"))]
+    AuthUtf8 {
+        context: &'static str,
+        source: std::str::Utf8Error,
+    },
+    #[snafu(display("{context}: credential is missing the ':' separator"))]
+    AuthMissingSeparator { context: &'static str },
     #[snafu(display("blob with digest {digest} is missing from oci archive"))]
     BlobMissing { digest: String },
     #[snafu(display("failed to deserialize image configuration received from registry: {source}"))]
@@ -71,6 +95,26 @@ pub enum Error {
     ImageNotValid,
     #[snafu(display("invalid algorithm in digest: {algorithm}"))]
     InvalidAlgorithm { algorithm: String },
+    #[snafu(display("invalid digest: {reason}"))]
+    InvalidDigest { reason: String },
+    #[snafu(display(
+        "invalid platform specifier '{value}': expected '<os>/<architecture>' (e.g. 'linux/amd64')"
+    ))]
+    InvalidPlatformFormat { value: String },
+    #[snafu(display(
+        "invalid platform specifier '{value}': os and architecture components must both be non-empty"
+    ))]
+    InvalidPlatformEmpty { value: String },
+    #[snafu(display("layer size mismatch: expected {expected} bytes, got {actual} bytes"))]
+    LayerSizeMismatch { expected: usize, actual: usize },
+    #[snafu(display("layer digest mismatch: expected {expected}, computed {actual}"))]
+    DigestMismatch { expected: String, actual: String },
+    #[snafu(display("unsupported operation: {reason}"))]
+    Unsupported { reason: String },
+    #[snafu(display("background task panicked or was cancelled: {source}"))]
+    Join { source: JoinError },
+    #[snafu(display("internal invariant violated: {context}"))]
+    Internal { context: &'static str },
     #[snafu(display("failed to unpack archive from layer: {source}"))]
     LayerArchive { source: std::io::Error },
     #[snafu(display("failed to copy from layer: {source}"))]

@@ -22,7 +22,7 @@ impl Manifest {
     pub async fn run(&self, _ctx: &Ctx) -> Result<(), error::Error> {
         let mut uri = Uri::new(self.url.as_str()).await?;
         uri.set_secure(!self.insecure);
-        let platform: Option<Platform> = self.platform.clone().map(|x| x.into());
+        let platform: Option<Platform> = self.platform.clone().map(|x| x.parse()).transpose()?;
         let index = Index::fetch(&uri).await?;
         let image = index.fetch_image(&uri, platform).await?;
         println!(

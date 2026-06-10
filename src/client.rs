@@ -1,12 +1,14 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use crate::digest::Digest;
 use crate::models::Token;
 use crate::{Result, error};
 use async_trait::async_trait;
 use bytes::Bytes;
+use reqwest::header::LOCATION;
 use reqwest::{RequestBuilder, Response};
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use url::Url;
 
 /// A trait for a client implementing requests to an OCI registry.
@@ -24,7 +26,7 @@ pub(crate) trait RegistryClientImpl: Send + Sync + Debug {
     async fn get_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response>;
     /// DELETE {uri}/v2/{repository}/blobs/{digest}
     async fn del_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response>;
-    /// POST {url}/v2/{repository}/blobs/uploads/
+    /// POST {url}/v2/{repository}/blobs/uploads/?digest={digest} (monolithic upload)
     async fn post_blob(
         &self,
         uri: &Url,
@@ -32,22 +34,20 @@ pub(crate) trait RegistryClientImpl: Send + Sync + Debug {
         data: Bytes,
         digest: &str,
     ) -> Result<Response>;
-    /// POST {url}/v2/{repository}/blobs/uploads/ START chunked upload
+    /// POST {url}/v2/{repository}/blobs/uploads/ to start a chunked upload.
     async fn start_upload(&self, uri: &Url, repository: &str) -> Result<Response>;
-    /// PATCH {url}/v2/{upload_url}
+    /// PATCH against an upload URL returned by the registry.
     async fn upload_part(
         &self,
-        uri: &Url,
-        upload: &str,
+        upload_url: &Url,
         data: Bytes,
         start: usize,
         end: usize,
     ) -> Result<Response>;
-    /// PUT {url}/v2/{upload_url}
+    /// PUT against an upload URL with the final digest query parameter.
     async fn finish_blob_upload(
         &self,
-        uri: &Url,
-        upload: &str,
+        upload_url: &Url,
         data: Bytes,
         digest: &str,
         start: usize,
@@ -173,20 +173,19 @@ impl RegistryClientImpl for SimpleRegistryClient {
 
     async fn upload_part(
         &self,
-        uri: &Url,
-        upload: &str,
+        upload_url: &Url,
         data: Bytes,
         start: usize,
         end: usize,
     ) -> Result<Response> {
-        let request = self.client.patch(
-            uri.join(&format!("/v2/{}/blobs/uploads/{}", upload, upload))
-                .context(error::UrlSnafu)?,
-        );
+        // Content-Range uses inclusive endpoints per RFC 7233; callers pass the
+        // exclusive end (`start + len`) so subtract 1 for the wire format.
+        let last = end.saturating_sub(1);
+        let request = self.client.patch(upload_url.clone());
         self.auth(request)
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", data.len())
-            .header("Content-Range", format!("{}-{}", start, end))
+            .header("Content-Range", format!("{}-{}", start, last))
             .body(data)
             .send()
             .await
@@ -195,26 +194,33 @@ impl RegistryClientImpl for SimpleRegistryClient {
 
     async fn finish_blob_upload(
         &self,
-        uri: &Url,
-        upload: &str,
+        upload_url: &Url,
         data: Bytes,
         digest: &str,
         start: usize,
         end: usize,
     ) -> Result<Response> {
-        let mut uri = uri
-            .join(&format!("/v2/{}/blobs/uploads/{}", upload, upload))
-            .context(error::UrlSnafu)?;
-        uri.set_query(Some(format!("digest={digest}").as_str()));
+        let mut uri = upload_url.clone();
+        // Append digest while preserving any pre-existing query params placed
+        // there by the registry (some, like ECR, embed signature material).
+        let new_query = match uri.query() {
+            Some(existing) if !existing.is_empty() => format!("{existing}&digest={digest}"),
+            _ => format!("digest={digest}"),
+        };
+        uri.set_query(Some(&new_query));
         let request = self.client.put(uri);
-        self.auth(request)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", data.len())
-            .header("Content-Range", format!("{}-{}", start, end))
-            .body(data)
-            .send()
-            .await
-            .context(error::RequestSnafu)
+        let request = if data.is_empty() {
+            self.auth(request).header("Content-Length", 0)
+        } else {
+            // Inclusive end byte per RFC 7233 / OCI distribution spec.
+            let last = end.saturating_sub(1);
+            self.auth(request)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", data.len())
+                .header("Content-Range", format!("{}-{}", start, last))
+                .body(data)
+        };
+        request.send().await.context(error::RequestSnafu)
     }
 
     async fn head_manifest(
@@ -268,7 +274,8 @@ impl RegistryClientImpl for SimpleRegistryClient {
 /// Handle to OCI registry HTTP operations.
 ///
 /// Wraps the underlying client implementation to enable dependency injection
-/// and unit testing.
+/// and unit testing. The inner trait already requires `Send + Sync + Debug`,
+/// so `Arc<dyn ...>` provides safe sharing without any `unsafe impl`.
 #[derive(Clone, Debug)]
 pub struct RegistryClient {
     client: Arc<dyn RegistryClientImpl>,
@@ -313,51 +320,41 @@ impl RegistryClient {
     }
 
     pub async fn post_blob(
-        self,
+        &self,
         uri: Url,
         repository: String,
         data: Bytes,
         digest: String,
     ) -> Result<Response> {
         self.client
-            .as_ref()
             .post_blob(&uri, repository.as_str(), data, digest.as_str())
             .await
     }
 
-    pub async fn start_upload(self, uri: Url, repository: String) -> Result<Response> {
-        self.client
-            .as_ref()
-            .start_upload(&uri, repository.as_str())
-            .await
+    pub async fn start_upload(&self, uri: Url, repository: String) -> Result<Response> {
+        self.client.start_upload(&uri, repository.as_str()).await
     }
 
     pub async fn upload_part(
-        self,
-        uri: Url,
-        upload: String,
+        &self,
+        upload_url: Url,
         data: Bytes,
         start: usize,
         end: usize,
     ) -> Result<Response> {
-        self.client
-            .as_ref()
-            .upload_part(&uri, upload.as_str(), data, start, end)
-            .await
+        self.client.upload_part(&upload_url, data, start, end).await
     }
 
     pub async fn finish_blob_upload(
-        self,
-        uri: Url,
-        upload: String,
+        &self,
+        upload_url: Url,
         data: Bytes,
         digest: String,
         start: usize,
         end: usize,
     ) -> Result<Response> {
         self.client
-            .as_ref()
-            .finish_blob_upload(&uri, upload.as_str(), data, digest.as_str(), start, end)
+            .finish_blob_upload(&upload_url, data, digest.as_str(), start, end)
             .await
     }
 
@@ -407,5 +404,21 @@ impl RegistryClient {
     }
 }
 
-unsafe impl Send for RegistryClient {}
-unsafe impl Sync for RegistryClient {}
+/// Extract the `Location` header from a response and resolve it against the
+/// request base URL. Registries are allowed to return either an absolute URL
+/// (ECR commonly does this with a different host) or a relative path.
+pub(crate) fn extract_location(response: &Response, base: &Url) -> crate::Result<Url> {
+    let header = response
+        .headers()
+        .get(LOCATION)
+        .context(error::StartBlobNoLocationSnafu)?
+        .to_str()
+        .context(error::ImproperHeaderSnafu)?;
+    base.join(header).context(error::UrlSnafu)
+}
+
+/// Convenience: validate a digest string and return the canonical form.
+#[allow(dead_code)]
+pub(crate) fn validate_digest(digest: &str) -> crate::Result<Digest> {
+    Digest::parse(digest)
+}

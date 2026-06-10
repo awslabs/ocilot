@@ -1,9 +1,11 @@
 use base64::Engine;
 use bon::Builder;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use snafu::{OptionExt, ResultExt};
 use std::env::consts;
+use std::str::FromStr;
 use std::{collections::HashMap, fmt};
 
 /// Handles all the supported media type enumerations by this tool.
@@ -184,13 +186,33 @@ impl Default for Platform {
     }
 }
 
-impl From<String> for Platform {
-    fn from(value: String) -> Self {
-        let (os, architecture) = value.split_once("/").unwrap();
-        Self {
+impl FromStr for Platform {
+    type Err = crate::error::Error;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (os, architecture) = value.split_once('/').context(
+            crate::error::InvalidPlatformFormatSnafu {
+                value: value.to_string(),
+            },
+        )?;
+        snafu::ensure!(
+            !os.is_empty() && !architecture.is_empty(),
+            crate::error::InvalidPlatformEmptySnafu {
+                value: value.to_string(),
+            }
+        );
+        Ok(Self {
             architecture: architecture.to_string(),
             os: os.to_string(),
-        }
+        })
+    }
+}
+
+impl TryFrom<String> for Platform {
+    type Error = crate::error::Error;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
     }
 }
 
@@ -232,7 +254,8 @@ pub struct Config {
 #[serde(rename_all = "snake_case")]
 pub struct History {
     #[builder(into)]
-    pub created: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<Timestamp>,
     #[builder(into)]
     pub created_by: String,
     #[builder(into)]
@@ -251,7 +274,8 @@ pub struct ImageConfig {
     #[builder(into)]
     pub config: Config,
     #[builder(into)]
-    pub created: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<Timestamp>,
     #[builder(into)]
     pub history: Vec<History>,
     #[builder(into)]
@@ -380,22 +404,39 @@ pub enum Token {
 }
 
 impl Token {
-    pub fn parse(value: DockerAuth) -> Option<Self> {
+    /// Build a token from a parsed docker auth file entry.
+    ///
+    /// Returns `Ok(None)` when the entry has neither an identity token nor
+    /// a basic auth blob. Returns `Err(InvalidAuth)` when the basic auth
+    /// blob is present but cannot be decoded as `username:password`. This
+    /// replaces the previous `unwrap`-based implementation that would
+    /// panic on malformed config files (#9).
+    pub fn parse(value: DockerAuth) -> Result<Option<Self>, crate::error::Error> {
         if let Some(identitytoken) = value.identitytoken {
-            Some(Self::Bearer(identitytoken))
-        } else if let Some(auth) = value.auth {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(auth)
-                .unwrap();
-            let decoded = String::from_utf8_lossy(&decoded);
-            let (username, password) = decoded.split_once(':').unwrap();
-            Some(Self::Basic {
-                username: username.to_string(),
-                password: password.to_string(),
-            })
-        } else {
-            None
+            return Ok(Some(Self::Bearer(identitytoken)));
         }
+        let Some(auth) = value.auth else {
+            return Ok(None);
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(auth)
+            .context(crate::error::AuthBase64DecodeSnafu {
+                context: "docker auth",
+            })?;
+        let decoded =
+            std::str::from_utf8(&decoded).context(crate::error::AuthUtf8Snafu {
+                context: "docker auth",
+            })?;
+        let (username, password) =
+            decoded
+                .split_once(':')
+                .context(crate::error::AuthMissingSeparatorSnafu {
+                    context: "docker auth",
+                })?;
+        Ok(Some(Self::Basic {
+            username: username.to_string(),
+            password: password.to_string(),
+        }))
     }
 }
 
@@ -410,4 +451,43 @@ pub struct DockerConfig {
 pub struct DockerAuth {
     pub auth: Option<String>,
     pub identitytoken: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_parses_valid() {
+        let p: Platform = "linux/amd64".parse().expect("should parse");
+        assert_eq!(p.os, "linux");
+        assert_eq!(p.architecture, "amd64");
+    }
+
+    #[test]
+    fn platform_rejects_missing_separator() {
+        let err = "linux".parse::<Platform>().expect_err("should fail");
+        assert!(matches!(
+            err,
+            crate::error::Error::InvalidPlatformFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn platform_rejects_empty_components() {
+        assert!(matches!(
+            "/amd64".parse::<Platform>(),
+            Err(crate::error::Error::InvalidPlatformEmpty { .. })
+        ));
+        assert!(matches!(
+            "linux/".parse::<Platform>(),
+            Err(crate::error::Error::InvalidPlatformEmpty { .. })
+        ));
+    }
+
+    #[test]
+    fn platform_try_from_string_round_trips_display() {
+        let p = Platform::try_from("linux/arm64".to_string()).unwrap();
+        assert_eq!(p.to_string(), "linux/arm64");
+    }
 }

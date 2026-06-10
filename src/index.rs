@@ -1,15 +1,15 @@
 use std::str::FromStr;
 
+use crate::digest::Digest;
 use crate::error;
 use crate::image::Image;
 use crate::layer::Layer;
 use crate::models::MediaType;
 use crate::models::Platform;
+use crate::progress::SharedProgress;
 use crate::uri::{Reference, Uri};
 use bon::Builder;
-use futures::future::join_all;
-#[cfg(feature = "progress")]
-use indicatif::MultiProgress;
+use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 use tempfile::tempdir;
@@ -143,13 +143,16 @@ impl Index {
         Ok(())
     }
 
-    /// Create an OCI tar archive that contains either all of the index images (if no platform provided)
-    /// or only the platforms specified
+    /// Create an OCI tar archive that contains either all of the index
+    /// images (if no platform provided) or only the platforms specified.
+    /// Pass a populated [`SharedProgress`] for progress reporting or
+    /// [`SharedProgress::none`] for silent operation.
     pub async fn to_oci<W>(
         &self,
         uri: &Uri,
         platform: Option<Platform>,
         output: W,
+        progress: SharedProgress,
     ) -> crate::Result<()>
     where
         W: AsyncWrite + Unpin + Send + 'static,
@@ -188,6 +191,7 @@ impl Index {
 
         // Now for every manifest we are working with we need to store it out
         for manifest in index.manifests.iter() {
+            let manifest_digest = Digest::parse(manifest.digest())?;
             let image_uri = Uri::builder()
                 .registry(uri.registry().clone())
                 .repository(uri.repository())
@@ -196,19 +200,15 @@ impl Index {
             let image = Image::fetch(&image_uri, manifest.platform().clone()).await?;
             // Write the image manifest as a blob
             let manifest_bytes = serde_json::to_string(&image).context(error::SerializeSnafu)?;
-            tokio::fs::write(
-                blob_dir.join(manifest.digest().strip_prefix("sha256:").unwrap()),
-                &manifest_bytes,
-            )
-            .await
-            .context(error::FileSnafu)?;
+            tokio::fs::write(blob_dir.join(manifest_digest.hex()), &manifest_bytes)
+                .await
+                .context(error::FileSnafu)?;
             // Copy the image config
-            let mut config_reader = image.config().open(uri).await?;
-            let mut config_file = File::create(
-                blob_dir.join(image.config().digest().strip_prefix("sha256:").unwrap()),
-            )
-            .await
-            .context(error::FileSnafu)?;
+            let config_digest = Digest::parse(image.config().digest())?;
+            let mut config_reader = image.config().open(uri, progress.as_ref()).await?;
+            let mut config_file = File::create(blob_dir.join(config_digest.hex()))
+                .await
+                .context(error::FileSnafu)?;
             Layer::copy(&mut config_reader, &mut config_file, image.config().size()).await?;
 
             let mut tasks: Vec<JoinHandle<crate::Result<()>>> = Vec::new();
@@ -216,124 +216,24 @@ impl Index {
                 let layer = layer.clone();
                 let uri = uri.clone();
                 let blob_dir = blob_dir.clone();
+                let progress = progress.clone();
                 tasks.push(tokio::spawn(async move {
-                    let mut reader = layer.open(&uri).await?;
-                    let mut blob_file = File::create(
-                        blob_dir.join(layer.digest().strip_prefix("sha256:").unwrap()),
-                    )
-                    .await
-                    .context(error::FileSnafu)?;
+                    let layer_digest = Digest::parse(layer.digest())?;
+                    let mut reader = layer.open(&uri, progress.as_ref()).await?;
+                    let mut blob_file = File::create(blob_dir.join(layer_digest.hex()))
+                        .await
+                        .context(error::FileSnafu)?;
                     Layer::copy(&mut reader, &mut blob_file, layer.size()).await?;
                     Ok(())
                 }));
             }
-            for result in join_all(tasks).await {
-                let result = result.context(error::LayerWaitSnafu)?;
-                result?;
-            }
-        }
-
-        let mut archive = ArchiveBuilder::new(output);
-        archive
-            .append_dir_all(".", tmp_dir.path().to_path_buf())
-            .await
-            .context(error::ArchiveSnafu)?;
-        archive.finish().await.context(error::ArchiveSnafu)?;
-
-        Ok(())
-    }
-
-    /// Create an OCI tar archive that contains either all of the index images (if no platform provided)
-    /// or only the platforms specified
-    #[cfg(feature = "progress")]
-    pub async fn to_oci_progress<W>(
-        &self,
-        uri: &Uri,
-        platform: Option<Platform>,
-        output: W,
-        multi: &mut MultiProgress,
-    ) -> crate::Result<()>
-    where
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let tmp_dir = tempdir().context(error::TempSnafu)?;
-        tokio::fs::write(
-            tmp_dir.path().join("oci-layout"),
-            r#"{ "imageLayoutVersion": "1.0.0" }"#,
-        )
-        .await
-        .context(error::FileSnafu)?;
-
-        let blob_dir = tmp_dir.path().join("blobs/sha256");
-        create_dir_all(&blob_dir)
-            .await
-            .context(error::DirectorySnafu)?;
-
-        // Start with ourselves for the index
-        let mut index = self.clone();
-        if let Some(platform) = platform {
-            // If we are selecting only a single platform then filter the manifests down
-            index.manifests = index
-                .manifests
-                .iter()
-                .filter(|x| x.platform() == Some(platform.clone()))
-                .cloned()
-                .collect::<Vec<Layer>>();
-            if index.manifests.is_empty() {
-                return error::IndexNoPlatformSnafu { platform }.fail();
-            }
-        }
-        let index_content = serde_json::to_string(&index).context(error::SerializeSnafu)?;
-        tokio::fs::write(tmp_dir.path().join("index.json"), &index_content)
-            .await
-            .context(error::FileSnafu)?;
-
-        // Now for every manifest we are working with we need to store it out
-        for manifest in index.manifests.iter() {
-            let image_uri = Uri::builder()
-                .registry(uri.registry().clone())
-                .repository(uri.repository())
-                .reference(Reference::from_str(manifest.digest())?)
-                .build();
-            let image = Image::fetch(&image_uri, manifest.platform().clone()).await?;
-            // Write the image manifest as a blob
-            let manifest_bytes = serde_json::to_string(&image).context(error::SerializeSnafu)?;
-            tokio::fs::write(
-                blob_dir.join(manifest.digest().strip_prefix("sha256:").unwrap()),
-                &manifest_bytes,
-            )
-            .await
-            .context(error::FileSnafu)?;
-            // Copy the image config
-            let mut config_reader = image.config().open_progress(uri, multi).await?;
-            let mut config_file = File::create(
-                blob_dir.join(image.config().digest().strip_prefix("sha256:").unwrap()),
-            )
-            .await
-            .context(error::FileSnafu)?;
-            Layer::copy(&mut config_reader, &mut config_file, image.config().size()).await?;
-
-            let mut tasks: Vec<JoinHandle<crate::Result<()>>> = Vec::new();
-            for layer in image.layers().iter() {
-                let layer = layer.clone();
-                let uri = uri.clone();
-                let mut multi = multi.clone();
-                let blob_dir = blob_dir.clone();
-                tasks.push(tokio::spawn(async move {
-                    let mut reader = layer.open_progress(&uri, &mut multi).await?;
-                    let mut blob_file = File::create(
-                        blob_dir.join(layer.digest().strip_prefix("sha256:").unwrap()),
-                    )
-                    .await
-                    .context(error::FileSnafu)?;
-                    Layer::copy(&mut reader, &mut blob_file, layer.size()).await?;
-                    Ok(())
-                }));
-            }
-            for result in join_all(tasks).await {
-                let result = result.context(error::LayerWaitSnafu)?;
-                result?;
-            }
+            // try_join_all aborts on first error and surfaces JoinErrors
+            // through the typed `Error::Join` variant (#4 + #11).
+            try_join_all(tasks)
+                .await
+                .context(error::JoinSnafu)?
+                .into_iter()
+                .collect::<crate::Result<Vec<_>>>()?;
         }
 
         let mut archive = ArchiveBuilder::new(output);

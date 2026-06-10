@@ -1,16 +1,16 @@
 #[cfg(feature = "compression")]
 use crate::compression::Decompress;
+use crate::digest::Digest;
 use crate::error;
 use crate::layer::Layer;
 use crate::models::{Config, ImageConfig, MediaType, Platform, TarballManifest};
+use crate::progress::{ProgressReporter, SharedProgress};
 use crate::uri::{Reference, Uri};
 use bon::Builder;
 use futures::StreamExt;
-use futures::future::join_all;
-#[cfg(feature = "progress")]
-use indicatif::MultiProgress;
+use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, ensure};
+use snafu::{OptionExt, ResultExt, ensure};
 use std::collections::HashSet;
 use tempfile::tempdir;
 use tokio::fs::File;
@@ -108,7 +108,7 @@ impl Image {
 
     /// Fetch and deserialize the image configuration from the registry
     pub async fn fetch_config(&self, uri: &Uri) -> crate::Result<ImageConfig> {
-        let mut layer = self.config.open(uri).await?;
+        let mut layer = self.config.open(uri, None).await?;
         let mut config = String::new();
         layer
             .read_to_string(&mut config)
@@ -117,11 +117,18 @@ impl Image {
         serde_json::from_str(config.as_str()).context(error::ConfigDeserializeSnafu)
     }
 
-    /// Extract the content of this image to filesystem. This method assumes that the layers are a series
-    /// of tar archives that can be extracted. It requires the compression feature in order to automatically
-    /// decompress the layers
+    /// Extract the content of this image to filesystem. This method assumes
+    /// that the layers are a series of tar archives that can be extracted.
+    /// It requires the compression feature in order to automatically
+    /// decompress the layers. Pass `Some(reporter)` for progress, `None`
+    /// for silent operation.
     #[cfg(feature = "compression")]
-    pub async fn filesystem<W>(&self, uri: &Uri, output: W) -> crate::Result<()>
+    pub async fn filesystem<W>(
+        &self,
+        uri: &Uri,
+        output: W,
+        progress: Option<&dyn ProgressReporter>,
+    ) -> crate::Result<()>
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
@@ -129,9 +136,9 @@ impl Image {
         let mut filemap: HashSet<String> = HashSet::new();
 
         for layer in self.layers.iter().rev() {
-            let reader = Decompress::new(layer.media_type(), layer.open(uri).await?);
+            let reader = Decompress::new(layer.media_type(), layer.open(uri, progress).await?)?;
             let mut layer = Archive::new(reader);
-            // Make sure to use the raw entry stream to avoid truncation of long links and long paths
+            // Use the raw entry stream to avoid truncation of long links and long paths.
             let mut entries = layer.entries_raw().context(error::LayerArchiveSnafu)?;
             while let Some(entry) = entries.next().await {
                 let mut entry = entry.context(error::LayerArchiveSnafu)?;
@@ -143,7 +150,6 @@ impl Image {
                 {
                     continue;
                 }
-
                 filemap.insert(path.to_string());
                 archive
                     .append(&header, &mut entry)
@@ -152,121 +158,22 @@ impl Image {
             }
         }
         archive.finish().await.context(error::ArchiveSnafu)?;
-
         Ok(())
     }
 
-    /// Extract the content of this image to filesystem. This method assumes that the layers are a series
-    /// of tar archives that can be extracted. It requires the compression feature in order to automatically
-    /// decompress the layers. It also reports to indicatif progress bars.
-    #[cfg(all(feature = "progress", feature = "compression"))]
-    pub async fn filesystem_progress<W>(
-        &self,
-        uri: &Uri,
-        output: W,
-        multi: &mut MultiProgress,
-    ) -> crate::Result<()>
-    where
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let mut archive = ArchiveBuilder::new(output);
-        let mut filemap: HashSet<String> = HashSet::new();
-
-        for layer in self.layers.iter().rev() {
-            let reader =
-                Decompress::new(layer.media_type(), layer.open_progress(uri, multi).await?);
-            let mut layer = Archive::new(reader);
-            // Make sure to use the raw entry stream to avoid truncation of long links and long paths
-            let mut entries = layer.entries_raw().context(error::LayerArchiveSnafu)?;
-            while let Some(entry) = entries.next().await {
-                let mut entry = entry.context(error::LayerArchiveSnafu)?;
-                let header = entry.header().clone();
-                let path = header.path().context(error::LayerArchiveSnafu)?;
-                let path = path.to_string_lossy();
-                if path.contains(WHITEOUT)
-                    || (header.entry_type().is_file() && filemap.contains(path.as_ref()))
-                {
-                    continue;
-                }
-
-                filemap.insert(path.to_string());
-                archive
-                    .append(&header, &mut entry)
-                    .await
-                    .context(error::LayerCopySnafu)?;
-            }
-        }
-        archive.finish().await.context(error::ArchiveSnafu)?;
-
-        Ok(())
-    }
-
-    /// Write this image out as a docker loadable tarball. This is NOT an oci archive and is primarily to be used with
-    /// docker/finch/podman/nerdctl load
+    /// Write this image out as a docker loadable tarball. This is NOT an
+    /// oci archive and is primarily to be used with
+    /// docker/finch/podman/nerdctl load. Pass a populated [`SharedProgress`]
+    /// for progress reporting or [`SharedProgress::none`] for silent
+    /// operation. `SharedProgress` is `Arc`-backed and `Clone` so it can
+    /// be moved into spawned tasks safely without `unsafe` lifetime
+    /// extension.
     #[cfg(feature = "compression")]
-    pub async fn to_tarball<W>(&self, uri: &Uri, output: W) -> crate::Result<()>
-    where
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let mut manifest = TarballManifest::builder()
-            .config(self.config.digest())
-            .repo_tags(vec![uri.to_string()])
-            .layers(vec![])
-            .build();
-        let tmp_dir = tempdir().context(error::TempSnafu)?;
-        let mut config_reader = self.config.open(uri).await?;
-        let mut config_file = File::create(tmp_dir.path().join(self.config.digest()))
-            .await
-            .context(error::FileSnafu)?;
-        Layer::copy(&mut config_reader, &mut config_file, self.config.size()).await?;
-
-        let mut tasks: Vec<JoinHandle<crate::Result<String>>> = Vec::new();
-        let tmp_path = tmp_dir.path().to_path_buf();
-        for layer in self.layers.iter() {
-            let layer = layer.clone();
-            let uri = uri.clone();
-            let tmp_path = tmp_path.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut reader = layer.open(&uri).await?;
-                let blob_layer = format!(
-                    "{}.tar{}",
-                    layer.digest().split_once(":").unwrap().1,
-                    layer.media_type().compression().to_ext()
-                );
-                let mut blob_file = File::create(tmp_path.join(blob_layer.clone()))
-                    .await
-                    .context(error::FileSnafu)?;
-                Layer::copy(&mut reader, &mut blob_file, layer.size()).await?;
-                Ok(blob_layer)
-            }));
-        }
-        for result in join_all(tasks).await {
-            let result = result.unwrap();
-            manifest.layers.push(result?);
-        }
-        let manifest_bytes =
-            serde_json::to_string(&vec![manifest]).context(error::SerializeSnafu)?;
-        tokio::fs::write(tmp_dir.path().join("manifest.json"), manifest_bytes)
-            .await
-            .context(error::FileSnafu)?;
-        let mut archive = ArchiveBuilder::new(output);
-        archive
-            .append_dir_all(".", tmp_dir.path().to_path_buf())
-            .await
-            .context(error::ArchiveSnafu)?;
-        archive.finish().await.context(error::ArchiveSnafu)?;
-
-        Ok(())
-    }
-
-    /// Write this image out as a docker loadable tarball. This is NOT an oci archive and is primarily to be used with
-    /// docker/finch/podman/nerdctl load. This version will report as it fetches the image to indicatif progress bars.
-    #[cfg(all(feature = "compression", feature = "progress"))]
-    pub async fn to_tarball_progress<W>(
+    pub async fn to_tarball<W>(
         &self,
         uri: &Uri,
         output: W,
-        progress: &mut MultiProgress,
+        progress: SharedProgress,
     ) -> crate::Result<()>
     where
         W: AsyncWrite + Unpin + Send + 'static,
@@ -277,24 +184,27 @@ impl Image {
             .layers(vec![])
             .build();
         let tmp_dir = tempdir().context(error::TempSnafu)?;
-        let mut config_reader = self.config.open_progress(uri, progress).await?;
+        let mut config_reader = self.config.open(uri, progress.as_ref()).await?;
         let mut config_file = File::create(tmp_dir.path().join(self.config.digest()))
             .await
             .context(error::FileSnafu)?;
         Layer::copy(&mut config_reader, &mut config_file, self.config.size()).await?;
 
+        // Each spawned task gets its own clone of the Arc-backed
+        // SharedProgress; no `unsafe` lifetime extension required.
         let mut tasks: Vec<JoinHandle<crate::Result<String>>> = Vec::new();
         let tmp_path = tmp_dir.path().to_path_buf();
         for layer in self.layers.iter() {
             let layer = layer.clone();
             let uri = uri.clone();
             let tmp_path = tmp_path.clone();
-            let mut multi = progress.clone();
+            let progress = progress.clone();
             tasks.push(tokio::spawn(async move {
-                let mut reader = layer.open_progress(&uri, &mut multi).await?;
+                let parsed = Digest::parse(layer.digest())?;
+                let mut reader = layer.open(&uri, progress.as_ref()).await?;
                 let blob_layer = format!(
                     "{}.tar{}",
-                    layer.digest().split_once(":").unwrap().1,
+                    parsed.hex(),
                     layer.media_type().compression().to_ext()
                 );
                 let mut blob_file = File::create(tmp_path.join(blob_layer.clone()))
@@ -304,9 +214,13 @@ impl Image {
                 Ok(blob_layer)
             }));
         }
-        for result in join_all(tasks).await {
-            let result = result.unwrap();
-            manifest.layers.push(result?);
+        // try_join_all aborts on first error and returns the join error
+        // properly typed; #4 + #11.
+        let names = try_join_all(tasks)
+            .await
+            .context(error::JoinSnafu)?;
+        for name in names {
+            manifest.layers.push(name?);
         }
         let manifest_bytes =
             serde_json::to_string(&vec![manifest]).context(error::SerializeSnafu)?;
@@ -339,14 +253,16 @@ impl Image {
     /// Create a new config layer blob for an image
     pub async fn create_config(uri: &Uri, config: &Config) -> crate::Result<Layer> {
         let config_bytes = serde_json::to_vec(config).context(error::SerializeSnafu)?;
-        let mut writer = Layer::create(uri, &MediaType::Config, config_bytes.len(), None)
+        let mut writer = Layer::create(uri, &MediaType::Config, config_bytes.len(), None, None)
             .await?
-            .unwrap();
+            .context(error::InternalSnafu {
+                context: "Layer::create returned None for config blob",
+            })?;
         writer
             .write_all(config_bytes.as_slice())
             .await
             .context(error::LayerWriteSnafu)?;
-        writer.flush().await.context(error::LayerWriteSnafu)?;
+        writer.shutdown().await.context(error::LayerWriteSnafu)?;
         writer.layer().await
     }
 }

@@ -24,16 +24,17 @@ impl Export {
         let mut uri = Uri::new(self.url.as_str()).await?;
         uri.set_secure(!self.insecure);
         let index = Index::fetch(&uri).await?;
+        let platform = self.platform.clone().map(|x| x.parse()).transpose()?;
         let image = index
-            .fetch_image(&uri, self.platform.clone().map(|x| x.into()))
+            .fetch_image(&uri, platform)
             .await?
             .context(error::ImageNotFoundSnafu { uri: uri.clone() })?;
 
         let file = tokio::fs::File::create(&self.output)
             .await
             .context(error::FileSnafu)?;
-        let multi = ctx.get();
-        image.filesystem_progress(&uri, file, multi).await?;
+        let progress = ctx.progress();
+        image.filesystem(&uri, file, progress.as_ref()).await?;
         Ok(())
     }
 }

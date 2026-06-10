@@ -1,10 +1,15 @@
 use cfg_if::cfg_if;
-use indicatif::MultiProgress;
+use ocilot::progress::SharedProgress;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Application context passed through command execution.
+///
+/// Holds a single `SharedProgress` (Arc-backed) that all commands clone
+/// when calling library APIs. With the `progress` feature this wraps the
+/// `indicatif` reporter; without it, [`SharedProgress::none`] is used so
+/// progress calls become no-ops.
 pub struct Ctx {
-    multi: MultiProgress,
+    progress: SharedProgress,
 }
 
 impl Ctx {
@@ -19,20 +24,26 @@ impl Ctx {
                     )
                     .with(indicatif_layer.with_filter(EnvFilter::from_default_env()))
                     .try_init()
-                    .unwrap();
+                    .ok();
+                let multi = indicatif::MultiProgress::new();
+                let reporter = std::sync::Arc::new(
+                    ocilot::progress::IndicatifReporter::new(multi),
+                );
+                let progress = SharedProgress::new(reporter);
             } else {
                 tracing_subscriber::registry()
                     .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_default_env()))
                     .try_init()
-                    .unwrap();;
-
+                    .ok();
+                let progress = SharedProgress::none();
             }
         }
-        let multi = MultiProgress::new();
-        Ok(Self { multi })
+        Ok(Self { progress })
     }
 
-    pub fn get(&mut self) -> &mut MultiProgress {
-        &mut self.multi
+    /// Get a clone of the shared progress reporter to hand off to library
+    /// calls. Cheap (single Arc clone).
+    pub fn progress(&self) -> SharedProgress {
+        self.progress.clone()
     }
 }
