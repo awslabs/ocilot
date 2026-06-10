@@ -46,12 +46,16 @@ base64 = "0.22"
 bon = "3"
 bytes = "1.11"
 cfg-if = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 indicatif = { version = "0.18", optional = true }
 home = "0.5"
-keyring = "3.6"
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
 reqwest = { version = "0.13", features = [
     "json",
     "stream",

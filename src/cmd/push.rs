@@ -4,7 +4,8 @@ use std::str::FromStr;
 use async_recursion::async_recursion;
 use clap::Parser;
 use futures::StreamExt;
-use futures::future::join_all;
+use futures::future::try_join_all;
+use ocilot::digest::Digest;
 use ocilot::error;
 use ocilot::image::Image;
 use ocilot::index::Index;
@@ -34,7 +35,7 @@ impl Push {
     pub async fn run(&self, ctx: &mut Ctx) -> Result<(), error::Error> {
         let mut uri = Uri::new(self.uri.as_str()).await?;
         uri.set_secure(!self.insecure);
-        let multi = ctx.get();
+        let progress = ctx.progress();
         let mut archive = File::open(&self.archive).await.context(error::FileSnafu)?;
         // We need to find the index first
         let mut index_entry = afind(&mut archive, |x| x.ends_with("index.json"))
@@ -49,8 +50,8 @@ impl Push {
             serde_json::from_slice(buffer.as_slice()).context(error::ImageInvalidIndexSnafu)?;
         index = find_index(&mut archive, &index).await?;
         for manifest in index.manifests().iter() {
-            let digest = manifest.digest().split_once(':').unwrap().1;
-            let mut blob_entry = afind(&mut archive, |x| x.ends_with(digest))
+            let manifest_digest = Digest::parse(manifest.digest())?;
+            let mut blob_entry = afind(&mut archive, |x| x.ends_with(manifest_digest.hex()))
                 .await?
                 .context(error::BlobMissingSnafu {
                     digest: manifest.digest(),
@@ -63,8 +64,8 @@ impl Push {
             let image: Image = serde_json::from_slice(buffer.as_slice())
                 .context(error::ImageInvalidManifestSnafu)?;
             // First lets copy the config blob
-            let cdigest = image.config().digest().split_once(':').unwrap().1;
-            let mut config_entry = afind(&mut archive, |x| x.ends_with(cdigest))
+            let config_digest = Digest::parse(image.config().digest())?;
+            let mut config_entry = afind(&mut archive, |x| x.ends_with(config_digest.hex()))
                 .await?
                 .context(error::BlobMissingSnafu {
                     digest: image.config().digest(),
@@ -74,13 +75,12 @@ impl Push {
                 .entry_size()
                 .context(error::ArchiveSnafu)?;
 
-            let mut writer = Layer::create_progress(
+            let mut writer = Layer::create(
                 &uri,
                 image.config().media_type(),
-                format!("blob {}", &cdigest[0..9]).as_str(),
-                config_size,
-                multi,
+                config_size as usize,
                 Some(image.config().digest().to_string()),
+                progress.as_ref(),
             )
             .await?;
             if let Some(writer) = writer.as_mut() {
@@ -93,10 +93,10 @@ impl Push {
                 let mut larchive = File::open(&self.archive).await.context(error::FileSnafu)?;
                 let layer = layer.clone();
                 let uri = uri.clone();
-                let mut multi = multi.clone();
+                let progress = progress.clone();
                 tasks.push(tokio::spawn(async move {
-                    let ldigest = layer.digest().split_once(":").unwrap().1;
-                    let mut layer_entry = afind(&mut larchive, |x| x.ends_with(ldigest))
+                    let layer_digest = Digest::parse(layer.digest())?;
+                    let mut layer_entry = afind(&mut larchive, |x| x.ends_with(layer_digest.hex()))
                         .await?
                         .context(error::BlobMissingSnafu {
                             digest: layer.digest(),
@@ -105,13 +105,12 @@ impl Push {
                         .header()
                         .entry_size()
                         .context(error::ArchiveSnafu)?;
-                    let mut writer = Layer::create_progress(
+                    let mut writer = Layer::create(
                         &uri,
                         layer.media_type(),
-                        format!("blob {}", &ldigest[0..9]).as_str(),
-                        layer_size,
-                        &mut multi,
+                        layer_size as usize,
                         Some(layer.digest().to_string()),
+                        progress.as_ref(),
                     )
                     .await?;
                     if let Some(writer) = writer.as_mut() {
@@ -121,10 +120,11 @@ impl Push {
                     Ok(())
                 }));
             }
-            for result in join_all(tasks).await {
-                let result = result.expect("failed to join");
-                result?;
-            }
+            try_join_all(tasks)
+                .await
+                .context(error::JoinSnafu)?
+                .into_iter()
+                .collect::<Result<Vec<_>, error::Error>>()?;
             let manifest_uri = Uri::builder()
                 .registry(uri.registry().clone())
                 .repository(uri.repository())
@@ -166,13 +166,12 @@ where
 #[async_recursion]
 async fn find_index<'a>(archive: &'a mut File, index: &Index) -> Result<Index, error::Error> {
     for manifest in index.manifests().iter() {
-        let digest = manifest.digest().split_once(':').unwrap().1;
-        let mut blob_entry =
-            afind(archive, |x| x.ends_with(digest))
-                .await?
-                .context(error::BlobMissingSnafu {
-                    digest: manifest.digest(),
-                })?;
+        let manifest_digest = Digest::parse(manifest.digest())?;
+        let mut blob_entry = afind(archive, |x| x.ends_with(manifest_digest.hex()))
+            .await?
+            .context(error::BlobMissingSnafu {
+                digest: manifest.digest(),
+            })?;
         let mut buffer = Vec::new();
         blob_entry
             .read_to_end(&mut buffer)

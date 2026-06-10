@@ -34,21 +34,21 @@ impl Pull {
         let mut uri = Uri::new(self.url.as_str()).await?;
         uri.set_secure(!self.insecure);
         let index = Index::fetch(&uri).await?;
-        let platform = self.platform.clone().map(|x| x.into());
+        let platform = self.platform.clone().map(|x| x.parse()).transpose()?;
 
         let output = tokio::fs::File::create(&self.output)
             .await
             .context(error::FileSnafu)?;
-        let multi = ctx.get();
+        let progress = ctx.progress();
         match self.format {
             Format::Tarball => {
                 let image = index
                     .fetch_image(&uri, platform.clone())
                     .await?
                     .context(error::ImageNotFoundSnafu { uri: uri.clone() })?;
-                image.to_tarball_progress(&uri, output, multi).await?
+                image.to_tarball(&uri, output, progress).await?
             }
-            Format::Oci => index.to_oci_progress(&uri, platform, output, multi).await?,
+            Format::Oci => index.to_oci(&uri, platform, output, progress).await?,
         }
 
         Ok(())

@@ -18,13 +18,16 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, ensure};
+use std::path::PathBuf;
 use url::Url;
 
 const COMMON_AUTH_FILES: &[&str] = &[".finch/config.json", ".docker/config.json"];
 
 /// Represents a client to a specific OCI registry.
 ///
-/// Most requests will go through this structure.
+/// Most requests will go through this structure. The inner `RegistryClient`
+/// is `Send + Sync + Debug` by virtue of its trait bound, so no `unsafe impl`
+/// is needed here.
 #[derive(Clone, Debug)]
 pub struct Registry {
     /// URI of the registry
@@ -35,28 +38,24 @@ pub struct Registry {
     is_ecr: bool,
 }
 
-unsafe impl Send for Registry {}
-unsafe impl Sync for Registry {}
-
 impl Registry {
     /// Given a uri to a registry create a new registry client and gather
     /// the appropriate authorization.
     pub async fn new(uri: &RegistryUri) -> Result<Self> {
-        // First check our common auth files for an entry
-        let mut token = None;
+        let mut token: Option<Token> = None;
         #[cfg(feature = "aws")]
         let mut is_ecr = false;
-        // If we get here then we may want to try and utilize credential helpers for given registry types
+        // Try AWS credential helpers first when the URI looks like ECR.
         cfg_if! {
             if #[cfg(feature = "aws")] {
                 if uri.base().starts_with("public.ecr.aws") {
                     debug!(target: "registry", "using public ecr");
-                    // Public ecr
                     let sdk_config = aws_config::defaults(BehaviorVersion::latest()).region("us-east-1").load().await;
                     let client = aws_sdk_ecrpublic::Client::new(&sdk_config);
                     let ecr_response = client.get_authorization_token().send()
                         .await
-                        .map_err(|e| { error!("public ecr: {:?}", e); error::Error::Authorization { reason: e.to_string() } })?;
+                        .inspect_err(|e| error!("public ecr: {:?}", e))
+                        .context(error::EcrPublicAuthSnafu)?;
                     trace!(target: "registry", "public ecr authorization response: {:?}", ecr_response);
                     is_ecr = true;
                     token = ecr_response.authorization_data()
@@ -70,60 +69,44 @@ impl Registry {
                     let ecr_response = ecr_client.get_authorization_token()
                         .send()
                         .await
-                        .map_err(|e| error::Error::Authorization { reason: e.to_string() })?;
+                        .context(error::EcrPrivateAuthSnafu)?;
                     trace!(target: "registry", "private ecr authorization response: {:?}", ecr_response);
-                    token = ecr_response.authorization_data()
-                        .first()
-                        .and_then(|x| {
-                            x.authorization_token().map(|y| {
-                                let decoded = base64::engine::general_purpose::STANDARD.decode(y).unwrap();
-                                Token::Basic { username: "AWS".to_string(), password: String::from_utf8_lossy(decoded.as_slice()).strip_prefix("AWS:").unwrap().to_string() }
-                            })
+                    if let Some(authorization_token) = ecr_response.authorization_data().first().and_then(|x| x.authorization_token()) {
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(authorization_token)
+                            .context(error::AuthBase64DecodeSnafu {
+                                context: "ecr authorization token",
+                            })?;
+                        let decoded_str = std::str::from_utf8(&decoded)
+                            .context(error::AuthUtf8Snafu {
+                                context: "ecr authorization token",
+                            })?;
+                        let (_user, password) = decoded_str
+                            .split_once(':')
+                            .context(error::AuthMissingSeparatorSnafu {
+                                context: "ecr authorization token",
+                            })?;
+                        token = Some(Token::Basic {
+                            username: "AWS".to_string(),
+                            password: password.to_string(),
                         });
+                    }
                 }
             }
         }
-        if token.is_none() {
-            // If a token hasn't been resolved try the keyring
+        // Then try config files in priority order. break on first hit so we
+        // never overwrite an earlier-resolved token with a later None value.
+        if token.is_none()
+            && let Some(home) = home_dir()
+        {
             for file in COMMON_AUTH_FILES {
-                if let Some(path) = home_dir() {
-                    let path = path.join(file);
-                    if path.exists() {
-                        let auth = tokio::fs::read_to_string(path)
-                            .await
-                            .context(error::FileSnafu)?;
-                        let config: DockerConfig =
-                            serde_json::from_str(&auth).context(error::ConfigDeserializeSnafu)?;
-                        if let Some(entry) = config.auths.get(uri.base()) {
-                            // If both the auth and identity token are null then the password is probably stored in the system keychai
-                            if entry.auth.is_none() && entry.identitytoken.is_none() {
-                                if let Ok(entry) =
-                                    Entry::new("docker-credential-helpers", uri.base())
-                                {
-                                    if let Ok(password) = entry.get_password() {
-                                        let decoded = base64::engine::general_purpose::STANDARD
-                                            .decode(password)
-                                            .unwrap();
-                                        let decoded = String::from_utf8_lossy(decoded.as_slice());
-                                        if decoded.contains(':') {
-                                            let (username, password) =
-                                                decoded.split_once(':').unwrap();
-                                            token = Some(Token::Basic {
-                                                username: username.to_string(),
-                                                password: password.to_string(),
-                                            });
-                                        } else {
-                                            token = Some(Token::Bearer(decoded.to_string()));
-                                        }
-                                    } else {
-                                        token = None;
-                                    }
-                                }
-                            } else {
-                                token = Token::parse(entry.clone());
-                            }
-                        }
-                    }
+                let path: PathBuf = home.join(file);
+                if !path.exists() {
+                    continue;
+                }
+                if let Some(found) = read_auth_file(&path, uri.base()).await? {
+                    token = Some(found);
+                    break;
                 }
             }
         }
@@ -151,7 +134,7 @@ impl Registry {
     }
 
     /// Get a ecr correct repository name
-    fn repository_name(&self, repository: &str) -> String {
+    pub(crate) fn repository_name(&self, repository: &str) -> String {
         cfg_if! {
             if #[cfg(feature = "aws")] {
                 if self.is_ecr {
@@ -171,7 +154,7 @@ impl Registry {
 
     // Fetch the catalog of repositories in the registry
     pub async fn catalog(&self) -> crate::Result<Vec<String>> {
-        let response = self.client.clone().catalog(self.url()?).await?;
+        let response = self.client.catalog(self.url()?).await?;
         trace!(target: "registry", "catalog: {:?}", response);
         ensure!(
             response.status().is_success(),
@@ -191,7 +174,6 @@ impl Registry {
         let repository = self.repository_name(repository);
         let response = self
             .client
-            .clone()
             .head_blob(self.url()?, repository, digest.into())
             .await?;
         trace!(target: "registry", "head_blob: {:?}", response);
@@ -210,7 +192,6 @@ impl Registry {
         let repository = self.repository_name(repository);
         let response = self
             .client
-            .clone()
             .get_blob(self.url()?, repository, digest.into())
             .await?;
         trace!(target: "registry", "get_blob: {:?}", response);
@@ -389,7 +370,84 @@ impl Registry {
             .json()
             .await
             .context(error::ResponseDeserializeSnafu)?;
-        trace!(target: "registry", "RESPONSE BODY: {}", serde_json::to_string_pretty(&value).unwrap());
+        if tracing::enabled!(tracing::Level::TRACE)
+            && let Ok(pretty) = serde_json::to_string_pretty(&value)
+        {
+            trace!(target: "registry", "RESPONSE BODY: {}", pretty);
+        }
         serde_json::from_value(value).context(error::BodyDeserializeSnafu)
+    }
+}
+
+/// Read a single docker/finch config file and resolve any matching auth
+/// for the given registry base. Returns Some(token) only when the file
+/// produced a token; never overwrites caller state with None.
+async fn read_auth_file(path: &std::path::Path, registry_base: &str) -> Result<Option<Token>> {
+    let auth = tokio::fs::read_to_string(path)
+        .await
+        .context(error::FileSnafu)?;
+    let config: DockerConfig =
+        serde_json::from_str(&auth).context(error::ConfigDeserializeSnafu)?;
+    let Some(entry) = config.auths.get(registry_base) else {
+        return Ok(None);
+    };
+    if entry.auth.is_none() && entry.identitytoken.is_none() {
+        // Fall back to the system keyring (docker-credential-helpers).
+        let Ok(keyring_entry) = Entry::new("docker-credential-helpers", registry_base) else {
+            return Ok(None);
+        };
+        let Ok(password) = keyring_entry.get_password() else {
+            return Ok(None);
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&password)
+            .context(error::AuthBase64DecodeSnafu {
+                context: "keyring credential",
+            })?;
+        let decoded_str = std::str::from_utf8(&decoded).context(error::AuthUtf8Snafu {
+            context: "keyring credential",
+        })?;
+        if let Some((username, password)) = decoded_str.split_once(':') {
+            return Ok(Some(Token::Basic {
+                username: username.to_string(),
+                password: password.to_string(),
+            }));
+        }
+        return Ok(Some(Token::Bearer(decoded_str.to_string())));
+    }
+    Token::parse(entry.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_auth_file_ignores_missing_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        tokio::fs::write(&path, r#"{"auths":{"other.io":{"auth":"dXNlcjpwYXNz"}}}"#)
+            .await
+            .unwrap();
+        let res = read_auth_file(&path, "absent.io").await.unwrap();
+        assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_auth_file_decodes_basic_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // base64("user:pass") = "dXNlcjpwYXNz"
+        tokio::fs::write(&path, r#"{"auths":{"present.io":{"auth":"dXNlcjpwYXNz"}}}"#)
+            .await
+            .unwrap();
+        let res = read_auth_file(&path, "present.io").await.unwrap();
+        match res {
+            Some(Token::Basic { username, password }) => {
+                assert_eq!(username, "user");
+                assert_eq!(password, "pass");
+            }
+            other => panic!("expected basic auth, got {other:?}"),
+        }
     }
 }

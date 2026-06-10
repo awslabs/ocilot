@@ -1,9 +1,9 @@
+use super::context::Ctx;
 use clap::Parser;
-use snafu::{OptionExt, ResultExt};
 use ocilot::error;
 use ocilot::index::Index;
 use ocilot::uri::Uri;
-use super::context::Ctx;
+use snafu::{OptionExt, ResultExt};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Get the config of an image", long_about = None)]
@@ -20,8 +20,9 @@ impl Config {
         let mut uri = Uri::new(self.url.as_str()).await?;
         uri.set_secure(!self.insecure);
         let index = Index::fetch(&uri).await?;
+        let platform = self.platform.clone().map(|x| x.parse()).transpose()?;
         let image = index
-            .fetch_image(&uri, self.platform.clone().map(|x| x.into()))
+            .fetch_image(&uri, platform)
             .await?
             .context(error::ImageNotFoundSnafu { uri: uri.clone() })?;
         let config = image.fetch_config(&uri).await?;

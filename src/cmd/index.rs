@@ -82,7 +82,7 @@ impl AddIndex {
         };
 
         // Now load the manifest we want to add
-        let platform: Option<Platform> = self.platform.clone().map(|x| x.into());
+        let platform: Option<Platform> = self.platform.clone().map(|x| x.parse()).transpose()?;
         // If a platform is set and reference is a tag we can use an index to find the right
         // image
         let image = if let Some(platform) = platform.as_ref() {

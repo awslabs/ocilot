@@ -1,14 +1,13 @@
+use crate::digest::Digest as DigestRef;
 use crate::error;
 use crate::models::MediaType;
 use crate::models::Platform;
+use crate::progress::{NoopHandle, ProgressHandle, ProgressReporter};
 use crate::uri::{Reference, Uri};
 use bon::Builder;
 use bytes::Bytes;
-use cfg_if::cfg_if;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-#[cfg(feature = "progress")]
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +17,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_util::io::StreamReader;
+use url::Url;
 
 /// Minimum chunk size for layer operations (5 MiB).
 const MIN_CHUNK_SIZE: usize = 5 * 1024 * 1024;
@@ -44,10 +44,11 @@ pub struct Layer {
 impl Layer {
     /// Perform a chunked copy of a layer from one reader to another.
     ///
-    /// Any time you want to interact with a layer in a registry, it is recommended
-    /// to use this method. While most OCI registry implementations do not need special
-    /// handling to make the chunks of data sent uniform, certain implementations
-    /// (i.e. ECR) work better when using more uniform chunked operations.
+    /// Any time you want to interact with a layer in a registry, it is
+    /// recommended to use this method. While most OCI registry
+    /// implementations do not need special handling to make the chunks of
+    /// data sent uniform, certain implementations (e.g. ECR) work better
+    /// when using more uniform chunked operations.
     pub async fn copy<'a, R, W>(
         reader: &'a mut R,
         writer: &'a mut W,
@@ -58,10 +59,8 @@ impl Layer {
         W: AsyncWrite + Unpin + ?Sized,
     {
         let mut index = 0;
-        // To determine the chunk size we do some math:
-        // 1. The chunk size should always be >= MIN_CHUNK_SIZE
-        // 2. The chunk size should always be <= MAX_CHUNK_SIZE
-        // 3. Ideally the chunk size should be 1/40th of the size of the layer (this lines up with how we print progress bar updates)
+        // Chunk size: clamped to [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]; aims for
+        // ~1/40th of the total to keep progress bars responsive.
         let chunk_size = (size / 40).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
         while index < size {
             let read_size = min(chunk_size, size - index);
@@ -74,20 +73,27 @@ impl Layer {
                 .write_all(buffer.as_slice())
                 .await
                 .context(error::LayerWriteSnafu)?;
-            index += chunk_size;
+            // Advance by the bytes actually read this iteration, not the
+            // unclamped chunk size; otherwise the final partial chunk
+            // would over-count and we'd terminate the loop early on
+            // exact-size layers.
+            index += read_size;
         }
         Ok(())
     }
 
-    /// Create a new later on a registry and repository
+    /// Create a new layer in a registry. Returns `Ok(None)` if the registry
+    /// already contains a blob with the given digest.
+    ///
+    /// Pass `Some(reporter)` to attach progress; pass `None` to suppress.
     pub async fn create(
         uri: &Uri,
         media_type: &MediaType,
         size: usize,
         digest: Option<String>,
+        progress: Option<&dyn ProgressReporter>,
     ) -> crate::Result<Option<Writer>> {
         if let Some(digest) = digest.as_ref() {
-            // Check if the registry already has this layer
             trace!(target: "layer", "checking if a blob already exists with the digest: {digest}");
             if uri
                 .registry()
@@ -98,125 +104,85 @@ impl Layer {
                 return Ok(None);
             }
         }
-
-        cfg_if! {
-            if #[cfg(feature = "progress")] {
-                Ok(Some(Writer {
-                    uri: uri.clone(),
-                    index: 0,
-                    size,
-                    media_type: media_type.clone(),
-                    upload_url: None,
-                    active: None,
-                    digest: Sha256::new(),
-                    progress: None,
-                }))
-            } else {
-                Ok(Some(Writer {
-                    uri: uri.clone(),
-                    index: 0,
-                    size,
-                    media_type: media_type.clone(),
-                    upload_url: None,
-                    active: None,
-                    digest: Sha256::new(),
-                }))
+        let handle: Box<dyn ProgressHandle> = match progress {
+            Some(reporter) => {
+                let label = digest
+                    .as_ref()
+                    .and_then(|d| DigestRef::parse(d).ok())
+                    .map(|d| format!("blob {} ->", d.short(9)))
+                    .unwrap_or_else(|| "blob ->".to_string());
+                reporter.start(size as u64, &label)
             }
-        }
-    }
-
-    /// Create a new layer and report upload progress via an indicatif progress bar
-    #[cfg(feature = "progress")]
-    pub async fn create_progress(
-        uri: &Uri,
-        media_type: &MediaType,
-        prefix: &str,
-        size: u64,
-        multi: &mut MultiProgress,
-        digest: Option<String>,
-    ) -> crate::Result<Option<Writer>> {
-        let bar = multi.add(ProgressBar::new(size));
-        bar.set_style(
-            ProgressStyle::with_template(
-                "-> {prefix}: [{elapsed_precise}] {bar:40.cyan/blue} {msg} ({binary_bytes:>7}/{binary_total_bytes:7})",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
-        bar.set_prefix(prefix.to_string());
-        if let Some(digest) = digest.as_ref() {
-            // Check if the registry already has this layer
-            trace!(target: "layer", "checking if a blob already exists with the digest: {digest}");
-            if uri
-                .registry()
-                .check_blob(uri.repository(), digest.as_str())
-                .await?
-            {
-                debug!(target: "layer", "blob already exists with the digest: {digest}");
-                bar.finish_with_message("already exists");
-                return Ok(None);
-            }
-        }
-
+            None => Box::new(NoopHandle),
+        };
         Ok(Some(Writer {
             uri: uri.clone(),
-            index: 0,
-            size: size as usize,
+            size,
             media_type: media_type.clone(),
-            upload_url: None,
-            active: None,
+            state: WriterState::Initial,
             digest: Sha256::new(),
-            progress: Some(bar),
+            written: 0,
+            buffer: Vec::new(),
+            progress: handle,
         }))
     }
 
-    /// Open a layer blob for reading
-    pub async fn open(&self, uri: &Uri) -> crate::Result<Reader> {
-        let (reader, _) = uri
-            .registry()
-            .fetch_blob(uri.repository(), self.digest.as_str())
-            .await?;
-        let reader = StreamReader::new(reader);
-        Ok(Reader::new(reader))
-    }
-
-    /// Open a layer blob for reading and report progress to an indicatif progress bar
-    #[cfg(feature = "progress")]
-    pub async fn open_progress(
+    /// Open a layer blob for reading. Pass `Some(reporter)` to attach
+    /// progress; pass `None` to suppress.
+    pub async fn open(
         &self,
         uri: &Uri,
-        multi: &mut MultiProgress,
+        progress: Option<&dyn ProgressReporter>,
     ) -> crate::Result<Reader> {
-        let prefix = &self.digest.strip_prefix("sha256:").unwrap()[0..9];
-        let (reader, _) = uri
+        let (stream, content_length) = uri
             .registry()
             .fetch_blob(uri.repository(), self.digest.as_str())
             .await?;
-        let bar = multi.add(ProgressBar::new(self.size as u64));
-        bar.set_style(
-            ProgressStyle::with_template(
-                "<- {prefix}: [{elapsed_precise}] {bar:40.cyan/blue} {msg} ({binary_bytes:>7}/{binary_total_bytes:7})",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
-        bar.set_prefix(format!("blob {prefix}"));
-        let reader = StreamReader::new(reader);
-        Ok(Reader::new_progress(reader, bar))
+        // #18: validate the registry's reported size up front when present.
+        let expected = self.size as u64;
+        if content_length != 0 && content_length != expected {
+            return error::LayerSizeMismatchSnafu {
+                expected: expected as usize,
+                actual: content_length as usize,
+            }
+            .fail();
+        }
+        let handle: Box<dyn ProgressHandle> = match progress {
+            Some(reporter) => {
+                let label = DigestRef::parse(&self.digest)
+                    .map(|d| format!("blob {} <-", d.short(9)))
+                    .unwrap_or_else(|_| "blob <-".to_string());
+                reporter.start(expected, &label)
+            }
+            None => Box::new(NoopHandle),
+        };
+        let stream_reader = StreamReader::new(stream);
+        Ok(Reader::new(
+            stream_reader,
+            handle,
+            Some(self.digest.clone()),
+            Some(self.size),
+        ))
     }
 
-    /// Open a layer for reading at the specified uri
+    /// Open a layer for reading at the specified URI (used for raw blob
+    /// access without a parent layer descriptor).
     pub async fn open_uri(uri: &Uri) -> crate::Result<Reader> {
         ensure!(
             matches!(uri.reference(), Reference::Digest { .. }),
             error::DirectLoadBlobSnafu { uri: uri.clone() }
         );
         let digest = uri.reference().to_string();
-        let (reader, _) = uri
+        let (stream, _size) = uri
             .registry()
             .fetch_blob(uri.repository(), digest.as_str())
             .await?;
-        Ok(Reader::new(StreamReader::new(reader)))
+        Ok(Reader::new(
+            StreamReader::new(stream),
+            Box::new(NoopHandle),
+            None,
+            None,
+        ))
     }
 
     /// Media type of the layer
@@ -247,52 +213,45 @@ impl Layer {
     }
 }
 
-/// Layer `AsyncRead` implementation with optional progress reporting.
-///
-/// Automatically reports to a progress bar if provided and the progress
-/// feature is enabled. It can also decompress the contents of the reader.
+/// Layer `AsyncRead` implementation with progress reporting and optional
+/// digest/size verification.
 pub struct Reader {
-    inner: Pin<Box<dyn AsyncRead>>,
-    #[cfg(feature = "progress")]
-    progress: Option<ProgressBar>,
+    inner: Pin<Box<dyn AsyncRead + Send + Sync>>,
+    progress: Box<dyn ProgressHandle>,
+    /// Expected digest of the streamed bytes; verified at EOF when set.
+    expected_digest: Option<String>,
+    expected_size: Option<usize>,
+    hasher: Sha256,
+    bytes_read: usize,
+    /// Set to true after we've validated the final digest at EOF, so we
+    /// don't run validation twice.
+    finalized: bool,
 }
-
-#[cfg(feature = "progress")]
-impl Drop for Reader {
-    fn drop(&mut self) {
-        if let Some(progress) = self.progress.as_mut() {
-            progress.finish_with_message("done");
-        }
-    }
-}
-
-unsafe impl Send for Reader {}
-unsafe impl Sync for Reader {}
 
 impl Reader {
-    /// Create a base reader
-    pub fn new(inner: impl AsyncRead + 'static) -> Self {
-        cfg_if! {
-            if #[cfg(feature = "progress")] {
-                Self {
-                    inner: Box::pin(inner),
-                    progress: None,
-                }
-            } else {
-                Self {
-                    inner: Box::pin(inner),
-                }
-            }
-        }
-    }
-
-    /// Create a reader that will report progress to an indicatif progress bar
-    #[cfg(feature = "progress")]
-    pub fn new_progress(inner: impl AsyncRead + 'static, progress: ProgressBar) -> Self {
+    /// Create a new reader. The progress handle is always present; pass
+    /// [`Box::new(NoopHandle)`] when progress is not desired.
+    pub fn new(
+        inner: impl AsyncRead + Send + Sync + 'static,
+        progress: Box<dyn ProgressHandle>,
+        expected_digest: Option<String>,
+        expected_size: Option<usize>,
+    ) -> Self {
         Self {
             inner: Box::pin(inner),
-            progress: Some(progress),
+            progress,
+            expected_digest,
+            expected_size,
+            hasher: Sha256::new(),
+            bytes_read: 0,
+            finalized: false,
         }
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.progress.finish();
     }
 }
 
@@ -303,69 +262,344 @@ impl AsyncRead for Reader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        let before = buf.filled().len();
         match this.inner.as_mut().poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                cfg_if! {
-                    if #[cfg(feature = "progress")] {
-                        if let Some(bar) = this.progress.as_mut() && buf.remaining() == 0 {
-                            bar.inc(buf.filled().len() as u64);
+                let after = buf.filled().len();
+                let delta = after - before;
+                if delta > 0 {
+                    let new_chunk = &buf.filled()[before..after];
+                    this.hasher.update(new_chunk);
+                    this.bytes_read += delta;
+                    if let Some(expected) = this.expected_size
+                        && this.bytes_read > expected
+                    {
+                        return Poll::Ready(Err(std::io::Error::other(format!(
+                            "registry returned more bytes than declared (expected {expected}, got {})",
+                            this.bytes_read
+                        ))));
+                    }
+                    this.progress.inc(delta as u64);
+                } else if !this.finalized {
+                    // EOF: validate digest and final size.
+                    this.finalized = true;
+                    if let Some(expected) = this.expected_size
+                        && this.bytes_read != expected
+                    {
+                        return Poll::Ready(Err(std::io::Error::other(format!(
+                            "short layer read (expected {expected}, got {})",
+                            this.bytes_read
+                        ))));
+                    }
+                    if let Some(expected) = this.expected_digest.as_ref() {
+                        let computed = format!(
+                            "sha256:{}",
+                            base16::encode_lower(this.hasher.clone().finalize().as_slice())
+                        );
+                        if computed != *expected {
+                            return Poll::Ready(Err(std::io::Error::other(format!(
+                                "layer digest mismatch: expected {expected}, computed {computed}"
+                            ))));
                         }
                     }
                 }
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            other => other,
         }
     }
 }
 
 /// `AsyncWrite` implementation that writes a blob to a registry.
 ///
-/// Automatically handles chunked upload versus single upload based on the
-/// size of the blob. Construction of this type is done by the Layer create methods.
+/// The state machine progresses Initial → Starting → Idle ↔ Uploading →
+/// Finishing → Done. Hash and offset state advance only after the registry
+/// confirms each chunk, so a failed PATCH does not leave callers with a
+/// digest computed from bytes that aren't actually durable.
 pub struct Writer {
     uri: Uri,
-
     media_type: MediaType,
-    upload_url: Option<String>,
-    index: usize,
+    /// Total expected blob size (from layer descriptor).
     size: usize,
+    /// Bytes the registry has confirmed accepted.
+    written: usize,
     digest: Sha256,
-    #[cfg(feature = "progress")]
-    progress: Option<ProgressBar>,
-    active: Option<Operation>,
+    state: WriterState,
+    /// Buffer of bytes that have been logically accepted from the caller
+    /// but not yet flushed/uploaded.
+    buffer: Vec<u8>,
+    progress: Box<dyn ProgressHandle>,
 }
 
-/// Represents the current state of an async write operation.
-enum Operation {
-    Error(BoxFuture<'static, Result<Bytes, reqwest::Error>>),
-    Start(BoxFuture<'static, crate::Result<Response>>),
-    Upload(BoxFuture<'static, crate::Result<Response>>),
+enum WriterState {
+    /// No upload has been initiated yet.
+    Initial,
+    /// POST {repo}/blobs/uploads/ is in flight to start the upload session.
+    Starting(BoxFuture<'static, crate::Result<Response>>),
+    /// We have an upload URL and are buffering bytes in `buffer`.
+    Idle { upload_url: Url },
+    /// PATCH is in flight; on success advance offset and update upload URL.
+    Uploading {
+        fut: BoxFuture<'static, crate::Result<Response>>,
+        chunk_len: usize,
+    },
+    /// PUT (final) is in flight. `pending_advance` is the number of bytes
+    /// in this final body that have not yet been credited to `written` or to
+    /// the progress bar; we advance both only after the registry confirms.
+    Finishing {
+        fut: BoxFuture<'static, crate::Result<Response>>,
+        pending_advance: usize,
+    },
+    /// Drained successfully and the blob is durable.
+    Done,
+    /// Sticky failure state; further polls return the saved error string.
+    Failed(String),
 }
 
 impl Writer {
-    /// Construct a layer object out of this writer, this also will signal a finish to the progress
-    /// bar in this writer if the feature is being used.
+    /// Finalize this writer into a [`Layer`]. Must be called after
+    /// `shutdown()` has returned `Ready(Ok)`.
     pub async fn layer(&mut self) -> crate::Result<Layer> {
-        let digest_bytes = self.digest.clone().finalize();
-        let digest = base16::encode_lower(&digest_bytes);
-        let digest = format!("sha256:{}", digest.clone());
-
-        cfg_if! {
-            if #[cfg(feature = "progress")] {
-                if let Some(bar) = self.progress.as_mut() {
-                    bar.finish_with_message("done");
-                }
-            }
-
+        if !matches!(self.state, WriterState::Done) {
+            return Err(error::Error::LayerWrite {
+                source: std::io::Error::other("writer.layer() called before shutdown"),
+            });
         }
+        let digest_bytes = self.digest.clone().finalize();
+        let digest = format!("sha256:{}", base16::encode_lower(&digest_bytes));
+        self.progress.finish();
         Ok(Layer {
             media_type: self.media_type.clone(),
-            digest: digest.clone(),
-            size: self.index,
+            digest,
+            size: self.written,
             platform: None,
         })
+    }
+
+    fn fail<E: std::fmt::Display>(&mut self, e: E) -> std::io::Error {
+        let s = e.to_string();
+        self.state = WriterState::Failed(s.clone());
+        std::io::Error::other(s)
+    }
+
+    /// Returns true if the buffer is large enough to flush eagerly.
+    fn buffer_ready_to_flush(&self) -> bool {
+        self.buffer.len() >= MIN_CHUNK_SIZE
+    }
+
+    /// Drive an in-flight upload future. On success, advance offsets and
+    /// transition back to `Idle`. On failure, transition to `Failed`.
+    fn poll_uploading(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let WriterState::Uploading { fut, chunk_len } = &mut self.state else {
+            unreachable!("poll_uploading called outside Uploading state");
+        };
+        match fut.poll_unpin(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(response)) => {
+                let chunk_len = *chunk_len;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let err = self.fail(format!("registry rejected chunk: {status}"));
+                    return Poll::Ready(Err(err));
+                }
+                // Resolve next upload URL from Location.
+                let next_url = match crate::client::extract_location(&response, &self.current_url())
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        let err = self.fail(e);
+                        return Poll::Ready(Err(err));
+                    }
+                };
+                self.written += chunk_len;
+                self.progress.inc(chunk_len as u64);
+                self.state = WriterState::Idle {
+                    upload_url: next_url,
+                };
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                let err = self.fail(e);
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+
+    fn poll_finishing(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let WriterState::Finishing {
+            fut,
+            pending_advance,
+        } = &mut self.state
+        else {
+            unreachable!("poll_finishing called outside Finishing state");
+        };
+        match fut.poll_unpin(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(response)) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let err = self.fail(format!("registry rejected blob finalize: {status}"));
+                    return Poll::Ready(Err(err));
+                }
+                // Only credit the durable bytes once the registry confirms
+                // the final PUT succeeded.
+                let advance = *pending_advance;
+                self.written += advance;
+                self.progress.inc(advance as u64);
+                self.state = WriterState::Done;
+                self.progress.finish();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                let err = self.fail(e);
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+
+    fn poll_starting(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let WriterState::Starting(fut) = &mut self.state else {
+            unreachable!("poll_starting called outside Starting state");
+        };
+        match fut.poll_unpin(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(response)) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let err = self.fail(format!("registry rejected upload start: {status}"));
+                    return Poll::Ready(Err(err));
+                }
+                let url = match crate::client::extract_location(&response, &self.current_url()) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        let err = self.fail(e);
+                        return Poll::Ready(Err(err));
+                    }
+                };
+                self.state = WriterState::Idle { upload_url: url };
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                let err = self.fail(e);
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+
+    fn current_url(&self) -> Url {
+        // Best-effort base URL for resolving Location headers; we use the
+        // original registry URL because that's what reqwest sent the
+        // request to. Errors here mean the registry URI itself is broken,
+        // which is fatal anyway.
+        self.uri
+            .registry()
+            .url()
+            .unwrap_or_else(|_| Url::parse("http://invalid.local/").expect("invariant"))
+    }
+
+    /// Kick off a PATCH for the buffered chunk. Caller guarantees that
+    /// `self.state` is `Idle` and the buffer is non-empty.
+    fn launch_patch(&mut self) {
+        let WriterState::Idle { upload_url } =
+            std::mem::replace(&mut self.state, WriterState::Done)
+        else {
+            unreachable!("launch_patch called outside Idle state");
+        };
+        let chunk = std::mem::take(&mut self.buffer);
+        let chunk_len = chunk.len();
+        // Hash the durable bytes; offset advance happens after the
+        // registry confirms the PATCH succeeded (#15).
+        self.digest.update(&chunk);
+        let bytes = Bytes::from(chunk);
+        let start = self.written;
+        let end = start + chunk_len;
+        let client = self.uri.registry().client.clone();
+        let upload_url_for_fut = upload_url.clone();
+        let fut = async move {
+            client
+                .upload_part(upload_url_for_fut, bytes, start, end)
+                .await
+        }
+        .boxed();
+        self.state = WriterState::Uploading { fut, chunk_len };
+    }
+
+    /// Kick off the final PUT. Caller guarantees Idle state.
+    fn launch_finish(&mut self) {
+        let WriterState::Idle { upload_url } =
+            std::mem::replace(&mut self.state, WriterState::Done)
+        else {
+            unreachable!("launch_finish called outside Idle state");
+        };
+        let chunk = std::mem::take(&mut self.buffer);
+        let chunk_len = chunk.len();
+        if chunk_len > 0 {
+            self.digest.update(&chunk);
+        }
+        let digest_bytes = self.digest.clone().finalize();
+        let digest = format!("sha256:{}", base16::encode_lower(&digest_bytes));
+        let bytes = Bytes::from(chunk);
+        let start = self.written;
+        let end = start + chunk_len;
+        let client = self.uri.registry().client.clone();
+        let fut = async move {
+            client
+                .finish_blob_upload(upload_url, bytes, digest, start, end)
+                .await
+        }
+        .boxed();
+        // Defer offset/progress advance to poll_finishing on success so that
+        // failed finalize attempts don't leave a corrupt accounting state.
+        self.state = WriterState::Finishing {
+            fut,
+            pending_advance: chunk_len,
+        };
+    }
+
+    /// Kick off a monolithic POST (single-shot upload). Caller guarantees
+    /// the buffer holds the entire blob and we are in Initial state.
+    fn launch_monolithic_post(&mut self) {
+        let chunk = std::mem::take(&mut self.buffer);
+        let chunk_len = chunk.len();
+        self.digest.update(&chunk);
+        let digest_bytes = self.digest.clone().finalize();
+        let digest = format!("sha256:{}", base16::encode_lower(&digest_bytes));
+        let bytes = Bytes::from(chunk);
+        let registry_url = match self.uri.registry().url() {
+            Ok(u) => u,
+            Err(e) => {
+                self.state = WriterState::Failed(e.to_string());
+                return;
+            }
+        };
+        let repository = self.uri.repository().clone();
+        let client = self.uri.registry().client.clone();
+        let fut = async move {
+            client
+                .post_blob(registry_url, repository, bytes, digest)
+                .await
+        }
+        .boxed();
+        // Defer offset/progress advance until poll_finishing confirms success.
+        self.state = WriterState::Finishing {
+            fut,
+            pending_advance: chunk_len,
+        };
+    }
+
+    /// Kick off a session-start POST. Caller guarantees Initial state.
+    fn launch_start(&mut self) {
+        let registry_url = match self.uri.registry().url() {
+            Ok(u) => u,
+            Err(e) => {
+                self.state = WriterState::Failed(e.to_string());
+                return;
+            }
+        };
+        let repository = self.uri.repository().clone();
+        let client = self.uri.registry().client.clone();
+        let fut = async move { client.start_upload(registry_url, repository).await }.boxed();
+        self.state = WriterState::Starting(fut);
     }
 }
 
@@ -376,152 +610,207 @@ impl AsyncWrite for Writer {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let this = self.get_mut();
-        if let Some(operation) = this.active.as_mut() {
-            match operation {
-                Operation::Start(poll) => match poll.poll_unpin(cx) {
-                    Poll::Ready(Ok(response)) => {
-                        trace!(target: "layer", "RESPONSE {:?}", response);
-                        this.active = None;
-                        if !response.status().is_success() {
-                            this.active = Some(Operation::Error(Box::pin(response.bytes())));
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
-                        }
-                        this.upload_url = response
-                            .headers()
-                            .get("Location")
-                            .and_then(|x| x.to_str().ok())
-                            .map(|x| x.to_string());
-                        trace!(target: "layer", "registry provided upload_url = {:?}", this.upload_url);
-                        // We return pending here with a wake to ensure we write the first buf
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
-                    Poll::Pending => {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
+        // Drive any pending async work to readiness first; that may
+        // transition us back to Idle so we can accept more bytes.
+        loop {
+            match &this.state {
+                WriterState::Failed(reason) => {
+                    return Poll::Ready(Err(std::io::Error::other(reason.clone())));
+                }
+                WriterState::Done => {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "writer is closed; further writes are rejected",
+                    )));
+                }
+                WriterState::Starting(_) => match this.poll_starting(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 },
-                Operation::Upload(poll) => match poll.poll_unpin(cx) {
-                    Poll::Ready(Ok(response)) => {
-                        trace!(target: "layer", "RESPONSE {:?}", response);
-                        this.active = None;
-                        if response.status().is_success() {
-                            cfg_if! {
-                                if #[cfg(feature = "progress")] {
-                                    if let Some(bar) = this.progress.as_mut() {
-                                        bar.inc(buf.len() as u64);
-                                    }
-                                }
-                            }
-                            Poll::Ready(Ok(buf.len()))
-                        } else {
-                            this.active = Some(Operation::Error(Box::pin(response.bytes())));
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                    }
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
-                    Poll::Pending => {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
+                WriterState::Uploading { .. } => match this.poll_uploading(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 },
-                Operation::Error(poll) => match poll.poll_unpin(cx) {
-                    Poll::Ready(Ok(response)) => {
-                        this.active = None;
-                        Poll::Ready(Err(std::io::Error::other(String::from_utf8_lossy(
-                            response.as_ref(),
-                        ))))
-                    }
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
-                    Poll::Pending => {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
+                WriterState::Finishing { .. } => match this.poll_finishing(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 },
+                WriterState::Initial | WriterState::Idle { .. } => break,
             }
-        } else if let Some(upload_url) = this.upload_url.as_ref() {
-            if this.index + buf.len() >= this.size {
-                // If our position plus the buffer we want to write is the end we should
-                // finish the upload
-                this.digest.update(buf);
-                let hash = this.digest.clone().finalize();
-                let digest = base16::encode_lower(hash.as_slice());
-                let url = this.uri.registry().url().map_err(std::io::Error::other)?;
-                this.active = Some(Operation::Upload(Box::pin(
-                    this.uri.registry().client.clone().finish_blob_upload(
-                        url,
-                        upload_url.clone(),
-                        Bytes::from_owner(buf.to_vec()),
-                        format!("sha256:{digest}"),
-                        this.index,
-                        this.size,
-                    ),
-                )));
-                this.index += buf.len();
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            } else {
-                // Otherwise we should send what we have as a patch
-                let url = this.uri.registry().url().map_err(std::io::Error::other)?;
-                this.active = Some(Operation::Upload(Box::pin(
-                    this.uri.registry().client.clone().upload_part(
-                        url,
-                        upload_url.clone(),
-                        Bytes::from_owner(buf.to_vec()),
-                        this.index,
-                        this.index + buf.len(),
-                    ),
-                )));
-                this.index += buf.len();
-                this.digest.update(buf);
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        } else if buf.len() == this.size {
-            // If we haven't started an upload and the passed buffer is equal to the size of the layer
-            // we are writing, we can send a single post upload
-            this.digest.update(buf);
-            let hash = this.digest.clone().finalize();
-            let digest = base16::encode_lower(hash.as_slice());
-            let url = this.uri.registry().url().map_err(std::io::Error::other)?;
-            this.active = Some(Operation::Upload(Box::pin(
-                this.uri.registry().client.clone().post_blob(
-                    url,
-                    this.uri.repository().clone(),
-                    Bytes::from_owner(buf.to_vec()),
-                    format!("sha256:{digest}"),
-                ),
-            )));
-            this.index = buf.len();
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        } else {
-            // If we have not started an upload we should do so now
-            let url = this.uri.registry().url().map_err(std::io::Error::other)?;
-            this.active = Some(Operation::Start(Box::pin(
-                this.uri
-                    .registry()
-                    .client
-                    .clone()
-                    .start_upload(url, this.uri.repository().clone()),
-            )));
-            this.index = 0;
-            cx.waker().wake_by_ref();
-            Poll::Pending
         }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        // Bound how much we accept this call so the buffer doesn't grow
+        // unbounded in one shot; the caller will simply be invoked again.
+        let to_take = buf.len().min(MAX_CHUNK_SIZE);
+        this.buffer.extend_from_slice(&buf[..to_take]);
+        // Decide whether to fire an upload now or accept and yield.
+        match this.state {
+            WriterState::Initial => {
+                // Have we now buffered the full blob? Then a single POST
+                // suffices. Otherwise we need a session-start.
+                if this.buffer.len() >= this.size && this.size > 0 {
+                    this.launch_monolithic_post();
+                } else if this.buffer_ready_to_flush() {
+                    this.launch_start();
+                }
+            }
+            WriterState::Idle { .. } => {
+                if this.buffer_ready_to_flush() {
+                    this.launch_patch();
+                }
+            }
+            _ => unreachable!("only Initial/Idle reachable post-drive"),
+        }
+        Poll::Ready(Ok(to_take))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        loop {
+            match &this.state {
+                WriterState::Failed(reason) => {
+                    return Poll::Ready(Err(std::io::Error::other(reason.clone())));
+                }
+                WriterState::Done => return Poll::Ready(Ok(())),
+                WriterState::Starting(_) => match this.poll_starting(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Uploading { .. } => match this.poll_uploading(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Finishing { .. } => match this.poll_finishing(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Initial | WriterState::Idle { .. } => return Poll::Ready(Ok(())),
+            }
+        }
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+        let this = self.get_mut();
+        loop {
+            match &this.state {
+                WriterState::Failed(reason) => {
+                    return Poll::Ready(Err(std::io::Error::other(reason.clone())));
+                }
+                WriterState::Done => return Poll::Ready(Ok(())),
+                WriterState::Starting(_) => match this.poll_starting(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Uploading { .. } => match this.poll_uploading(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Finishing { .. } => match this.poll_finishing(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Initial => {
+                    // No upload was started. Either the blob fit in the
+                    // buffer (single POST) or we have an empty blob.
+                    if !this.buffer.is_empty() {
+                        this.launch_monolithic_post();
+                        continue;
+                    }
+                    // Empty blob: no chunks to send. Mark Done.
+                    this.state = WriterState::Done;
+                    return Poll::Ready(Ok(()));
+                }
+                WriterState::Idle { .. } => {
+                    // Drain any remaining buffer through PUT.
+                    this.launch_finish();
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// Reader that returns short reads; verifies `Layer::copy` advances by
+    /// the actually-read amount, not by the unclamped chunk size.
+    struct ShortReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for ShortReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let remaining = this.data.len() - this.pos;
+            // Always serve in tiny pieces.
+            let take = remaining.min(7).min(buf.remaining());
+            buf.put_slice(&this.data[this.pos..this.pos + take]);
+            this.pos += take;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_handles_short_reads() {
+        let data = vec![0xABu8; 31];
+        let mut src = ShortReader {
+            data: data.clone(),
+            pos: 0,
+        };
+        let mut dst = Vec::new();
+        // Use a small "size" to force tight loop iterations.
+        Layer::copy(&mut src, &mut dst, data.len()).await.unwrap();
+        assert_eq!(dst, data);
+    }
+
+    #[tokio::test]
+    async fn reader_finalizes_digest_on_eof_when_present() {
+        // Empty stream with empty-data sha256.
+        let empty_digest =
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let mut r = Reader::new(
+            tokio::io::empty(),
+            Box::new(NoopHandle),
+            Some(empty_digest.to_string()),
+            Some(0),
+        );
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reader_detects_digest_mismatch() {
+        let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let mut r = Reader::new(
+            tokio::io::empty(),
+            Box::new(NoopHandle),
+            Some(bad_digest.to_string()),
+            Some(0),
+        );
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).await.unwrap_err();
+        assert!(err.to_string().contains("digest mismatch"));
     }
 }
