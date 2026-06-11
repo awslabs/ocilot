@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/awslabs/ocilot/compare/v0.1.0...v0.2.0) - 2026-06-11
+
+### Other
+
+- *(deps)* migrate keyring v3 to v4
+- address review feedback for soundness, correctness, and API hygiene
+
 ### Fixed (review-driven)
 
 - **#1** Replaced all `unsafe impl Send/Sync` (`RegistryClient`, `Registry`, `Decompress`, `Reader`) with sound trait-bound types backed by `Arc<dyn ... + Send + Sync>` and `Pin<Box<dyn AsyncRead + Send + Sync>>`.
