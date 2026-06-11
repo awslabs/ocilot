@@ -12,13 +12,14 @@ use bytes::Bytes;
 use cfg_if::cfg_if;
 use futures::stream::{Stream, TryStreamExt};
 use home::home_dir;
-use keyring::Entry;
+use keyring_core::Entry;
 use reqwest::Response;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, ensure};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use url::Url;
 
 const COMMON_AUTH_FILES: &[&str] = &[".finch/config.json", ".docker/config.json"];
@@ -379,6 +380,18 @@ impl Registry {
     }
 }
 
+/// Initialize the platform-native keyring store on first use.
+///
+/// `keyring` 4.x requires an explicit default credential store. We pick the
+/// OS-native one (Keychain on macOS, Credential Manager on Windows, keyutils
+/// on Linux, etc.) the first time the auth-file fallback path needs it.
+/// Returns true when a store is available; false when initialization fails,
+/// in which case callers should treat the keyring as unavailable.
+fn ensure_keyring_store() -> bool {
+    static INIT: OnceLock<bool> = OnceLock::new();
+    *INIT.get_or_init(|| keyring::use_native_store(false).is_ok())
+}
+
 /// Read a single docker/finch config file and resolve any matching auth
 /// for the given registry base. Returns Some(token) only when the file
 /// produced a token; never overwrites caller state with None.
@@ -393,6 +406,9 @@ async fn read_auth_file(path: &std::path::Path, registry_base: &str) -> Result<O
     };
     if entry.auth.is_none() && entry.identitytoken.is_none() {
         // Fall back to the system keyring (docker-credential-helpers).
+        if !ensure_keyring_store() {
+            return Ok(None);
+        }
         let Ok(keyring_entry) = Entry::new("docker-credential-helpers", registry_base) else {
             return Ok(None);
         };

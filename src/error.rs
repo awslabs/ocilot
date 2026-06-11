@@ -16,15 +16,31 @@ pub enum Error {
     #[cfg(feature = "aws")]
     #[snafu(display("failed to authorize with public ecr: {source}"))]
     EcrPublicAuth {
-        source: aws_sdk_ecrpublic::error::SdkError<
-            aws_sdk_ecrpublic::operation::get_authorization_token::GetAuthorizationTokenError,
+        #[snafu(source(from(
+            aws_sdk_ecrpublic::error::SdkError<
+                aws_sdk_ecrpublic::operation::get_authorization_token::GetAuthorizationTokenError,
+            >,
+            Box::new
+        )))]
+        source: Box<
+            aws_sdk_ecrpublic::error::SdkError<
+                aws_sdk_ecrpublic::operation::get_authorization_token::GetAuthorizationTokenError,
+            >,
         >,
     },
     #[cfg(feature = "aws")]
     #[snafu(display("failed to authorize with private ecr: {source}"))]
     EcrPrivateAuth {
-        source: aws_sdk_ecr::error::SdkError<
-            aws_sdk_ecr::operation::get_authorization_token::GetAuthorizationTokenError,
+        #[snafu(source(from(
+            aws_sdk_ecr::error::SdkError<
+                aws_sdk_ecr::operation::get_authorization_token::GetAuthorizationTokenError,
+            >,
+            Box::new
+        )))]
+        source: Box<
+            aws_sdk_ecr::error::SdkError<
+                aws_sdk_ecr::operation::get_authorization_token::GetAuthorizationTokenError,
+            >,
         >,
     },
     #[snafu(display("{context}: invalid base64 in credential: {source}"))]

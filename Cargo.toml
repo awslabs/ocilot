@@ -51,11 +51,8 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 indicatif = { version = "0.18", optional = true }
 home = "0.5"
-keyring = { version = "3", features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-] }
+keyring = "4"
+keyring-core = "1"
 reqwest = { version = "0.13", features = [
     "json",
     "stream",
