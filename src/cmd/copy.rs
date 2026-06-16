@@ -6,8 +6,9 @@ use futures::future::try_join_all;
 use ocilot::{
     Result, error,
     image::Image,
-    index::Index,
     layer::Layer,
+    manifest::Manifest,
+    progress::SharedProgress,
     uri::{Reference, Uri},
 };
 use snafu::ResultExt;
@@ -30,75 +31,97 @@ impl Copy {
         source.set_secure(!self.source_insecure);
         let mut target = Uri::new(self.target.as_str()).await?;
         target.set_secure(!self.target_insecure);
-        let index = Index::fetch(&source).await?;
         let progress = ctx.progress();
-        for manifest in index.manifests().iter() {
-            let manifest_uri = Uri::builder()
-                .registry(source.registry().clone())
-                .repository(source.repository())
-                .reference(Reference::from_str(manifest.digest())?)
-                .build();
-            let image = Image::fetch(&manifest_uri, manifest.platform().clone()).await?;
-            // Copy the config over
-            let config_uri = Uri::builder()
-                .registry(target.registry().clone())
-                .repository(target.repository())
-                .reference(Reference::from_str(image.config().digest())?)
-                .build();
+        // The source reference may resolve to either an image index or a
+        // single image manifest. Dispatch via `Manifest::fetch` so a digest
+        // pointing directly at an image is handled correctly.
+        match Manifest::fetch(&source).await? {
+            Manifest::Index(index) => {
+                for manifest in index.manifests().iter() {
+                    let manifest_uri = Uri::builder()
+                        .registry(source.registry().clone())
+                        .repository(source.repository())
+                        .reference(Reference::from_str(manifest.digest())?)
+                        .build();
+                    let image = Image::fetch(&manifest_uri, manifest.platform().clone()).await?;
+                    let target_manifest_uri = Uri::builder()
+                        .registry(target.registry().clone())
+                        .repository(target.repository())
+                        .reference(Reference::from_str(manifest.digest())?)
+                        .build();
+                    copy_image(&source, &target_manifest_uri, &image, &progress).await?;
+                }
+                // Now all images in the index are copied; push the index.
+                index.push(&target).await?;
+            }
+            Manifest::Image(image) => {
+                copy_image(&source, &target, &image, &progress).await?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Copy a single image (config + layers) from `source` to `target_manifest_uri`.
+async fn copy_image(
+    source: &Uri,
+    target_manifest_uri: &Uri,
+    image: &Image,
+    progress: &SharedProgress,
+) -> Result<()> {
+    // Copy the config blob.
+    let config_uri = Uri::builder()
+        .registry(target_manifest_uri.registry().clone())
+        .repository(target_manifest_uri.repository())
+        .reference(Reference::from_str(image.config().digest())?)
+        .build();
+    let mut writer = Layer::create(
+        &config_uri,
+        image.config().media_type(),
+        image.config().size(),
+        Some(image.config().digest().to_string()),
+        progress.as_ref(),
+    )
+    .await?;
+    if let Some(writer) = writer.as_mut() {
+        let mut reader = image.config().open(source, progress.as_ref()).await?;
+        Layer::copy(&mut reader, writer, image.config().size()).await?;
+        writer.layer().await?;
+    }
+
+    // Copy each layer in parallel.
+    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+    for layer in image.layers().iter() {
+        let source_uri = source.clone();
+        let target_uri = target_manifest_uri.clone();
+        let layer = layer.clone();
+        let progress = progress.clone();
+        tasks.push(tokio::spawn(async move {
             let mut writer = Layer::create(
-                &config_uri,
-                image.config().media_type(),
-                image.config().size(),
-                Some(image.config().digest().to_string()),
+                &target_uri,
+                layer.media_type(),
+                layer.size(),
+                Some(layer.digest().to_string()),
                 progress.as_ref(),
             )
             .await?;
             if let Some(writer) = writer.as_mut() {
-                let mut reader = image.config().open(&source, progress.as_ref()).await?;
-                Layer::copy(&mut reader, writer, image.config().size()).await?;
+                let mut reader = layer.open(&source_uri, progress.as_ref()).await?;
+                Layer::copy(&mut reader, writer, layer.size()).await?;
                 writer.layer().await?;
             }
-            // Now we are ready to copy the layers for this image
-            let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-            for layer in image.layers().iter() {
-                let source_uri = source.clone();
-                let target_uri = target.clone();
-                let layer = layer.clone();
-                let progress = progress.clone();
-                tasks.push(tokio::spawn(async move {
-                    let mut writer = Layer::create(
-                        &target_uri,
-                        layer.media_type(),
-                        layer.size(),
-                        Some(layer.digest().to_string()),
-                        progress.as_ref(),
-                    )
-                    .await?;
-                    if let Some(writer) = writer.as_mut() {
-                        let mut reader = layer.open(&source_uri, progress.as_ref()).await?;
-                        Layer::copy(&mut reader, writer, layer.size()).await?;
-                        writer.layer().await?;
-                    }
-                    Ok(())
-                }));
-            }
-            // try_join_all aborts on first error and reports JoinErrors
-            // through the typed Error::Join variant (#4 + #11).
-            try_join_all(tasks)
-                .await
-                .context(error::JoinSnafu)?
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            let target_manifest_uri = Uri::builder()
-                .registry(target.registry().clone())
-                .repository(target.repository())
-                .reference(Reference::from_str(manifest.digest())?)
-                .build();
-            image.push(&target_manifest_uri).await?;
-        }
-        // Now all images in index are copied push the index
-        index.push(&target).await?;
-
-        Ok(())
+            Ok(())
+        }));
     }
+    // try_join_all aborts on first error and reports JoinErrors
+    // through the typed Error::Join variant.
+    try_join_all(tasks)
+        .await
+        .context(error::JoinSnafu)?
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    image.push(target_manifest_uri).await?;
+    Ok(())
 }

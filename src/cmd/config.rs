@@ -1,7 +1,7 @@
 use super::context::Ctx;
 use clap::Parser;
 use ocilot::error;
-use ocilot::index::Index;
+use ocilot::manifest::Manifest;
 use ocilot::uri::Uri;
 use snafu::{OptionExt, ResultExt};
 
@@ -19,12 +19,16 @@ impl Config {
     pub async fn run(&self, _ctx: &Ctx) -> Result<(), error::Error> {
         let mut uri = Uri::new(self.url.as_str()).await?;
         uri.set_secure(!self.insecure);
-        let index = Index::fetch(&uri).await?;
         let platform = self.platform.clone().map(|x| x.parse()).transpose()?;
-        let image = index
-            .fetch_image(&uri, platform)
-            .await?
-            .context(error::ImageNotFoundSnafu { uri: uri.clone() })?;
+        // The reference may resolve to either an image index or a single
+        // image manifest; dispatch via `Manifest::fetch` to handle both.
+        let image = match Manifest::fetch(&uri).await? {
+            Manifest::Index(index) => index
+                .fetch_image(&uri, platform)
+                .await?
+                .context(error::ImageNotFoundSnafu { uri: uri.clone() })?,
+            Manifest::Image(image) => image,
+        };
         let config = image.fetch_config(&uri).await?;
         println!(
             "{}",

@@ -216,9 +216,7 @@ impl Image {
         }
         // try_join_all aborts on first error and returns the join error
         // properly typed; #4 + #11.
-        let names = try_join_all(tasks)
-            .await
-            .context(error::JoinSnafu)?;
+        let names = try_join_all(tasks).await.context(error::JoinSnafu)?;
         for name in names {
             manifest.layers.push(name?);
         }

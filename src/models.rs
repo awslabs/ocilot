@@ -190,11 +190,12 @@ impl FromStr for Platform {
     type Err = crate::error::Error;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        let (os, architecture) = value.split_once('/').context(
-            crate::error::InvalidPlatformFormatSnafu {
-                value: value.to_string(),
-            },
-        )?;
+        let (os, architecture) =
+            value
+                .split_once('/')
+                .context(crate::error::InvalidPlatformFormatSnafu {
+                    value: value.to_string(),
+                })?;
         snafu::ensure!(
             !os.is_empty() && !architecture.is_empty(),
             crate::error::InvalidPlatformEmptySnafu {
@@ -423,10 +424,9 @@ impl Token {
             .context(crate::error::AuthBase64DecodeSnafu {
                 context: "docker auth",
             })?;
-        let decoded =
-            std::str::from_utf8(&decoded).context(crate::error::AuthUtf8Snafu {
-                context: "docker auth",
-            })?;
+        let decoded = std::str::from_utf8(&decoded).context(crate::error::AuthUtf8Snafu {
+            context: "docker auth",
+        })?;
         let (username, password) =
             decoded
                 .split_once(':')
