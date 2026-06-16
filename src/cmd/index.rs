@@ -1,6 +1,7 @@
 use clap::Parser;
 use ocilot::error;
 use ocilot::layer::Layer;
+use ocilot::manifest::Manifest;
 use ocilot::models::Platform;
 use ocilot::uri::Reference;
 use ocilot::uri::Uri;
@@ -48,7 +49,16 @@ impl GetIndex {
     pub async fn run(&self, _ctx: &Ctx) -> Result<(), ocilot::error::Error> {
         let mut uri = Uri::new(self.url.as_str()).await?;
         uri.set_secure(!self.insecure);
-        let index = Index::fetch(&uri).await?;
+        // `index get` legitimately requires an index; if the reference
+        // resolves to a single image manifest we surface a typed error
+        // rather than the cryptic "missing field 'manifests'" deserialize
+        // failure that used to bubble up.
+        let index = match Manifest::fetch(&uri).await? {
+            Manifest::Index(index) => index,
+            Manifest::Image(_) => {
+                return error::NoIndexSnafu { uri: uri.clone() }.fail();
+            }
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&index).context(ocilot::error::SerializeSnafu)?
@@ -75,25 +85,39 @@ impl AddIndex {
         target.set_secure(!self.insecure);
         let mut source = Uri::new(self.source.as_str()).await?;
         source.set_secure(!self.insecure);
+        // Load (or initialize) the target index. If something exists at the
+        // target reference it must be an index — otherwise overwriting it
+        // with a new index would silently clobber an image manifest.
         let index = if Index::check(&target).await? {
-            Index::fetch(&target).await?
+            match Manifest::fetch(&target).await? {
+                Manifest::Index(index) => index,
+                Manifest::Image(_) => {
+                    return error::NoIndexSnafu {
+                        uri: target.clone(),
+                    }
+                    .fail();
+                }
+            }
         } else {
             Index::new(&[]).await
         };
 
-        // Now load the manifest we want to add
+        // Now load the manifest we want to add.
         let platform: Option<Platform> = self.platform.clone().map(|x| x.parse()).transpose()?;
-        // If a platform is set and reference is a tag we can use an index to find the right
-        // image
+        // If a platform is set and the source is a tag, the source could be
+        // either an index (pick the matching arch) or a single image manifest
+        // (use directly). Dispatch via `Manifest::fetch`.
         let image = if let Some(platform) = platform.as_ref() {
             if matches!(source.reference(), Reference::Tag(..)) {
-                let source_index = Index::fetch(&source).await?;
-                source_index
-                    .fetch_image(&source, Some(platform.clone()))
-                    .await?
-                    .context(error::IndexNoPlatformSnafu {
-                        platform: platform.clone(),
-                    })?
+                match Manifest::fetch(&source).await? {
+                    Manifest::Index(source_index) => source_index
+                        .fetch_image(&source, Some(platform.clone()))
+                        .await?
+                        .context(error::IndexNoPlatformSnafu {
+                            platform: platform.clone(),
+                        })?,
+                    Manifest::Image(image) => image,
+                }
             } else {
                 Image::fetch(&source, Some(platform.clone())).await?
             }

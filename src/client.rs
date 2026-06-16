@@ -11,6 +11,16 @@ use reqwest::{RequestBuilder, Response};
 use snafu::{OptionExt, ResultExt};
 use url::Url;
 
+/// Accept header sent on manifest requests so the registry returns the
+/// canonical manifest representation rather than an arbitrary default.
+/// Includes both OCI and Docker media types for maximum compatibility.
+pub(crate) const MANIFEST_ACCEPT: &str = concat!(
+    "application/vnd.oci.image.index.v1+json,",
+    "application/vnd.oci.image.manifest.v1+json,",
+    "application/vnd.docker.distribution.manifest.list.v2+json,",
+    "application/vnd.docker.distribution.manifest.v2+json",
+);
+
 /// A trait for a client implementing requests to an OCI registry.
 ///
 /// This is primarily implemented to allow for ease of unit testing this crate.
@@ -233,7 +243,11 @@ impl RegistryClientImpl for SimpleRegistryClient {
             uri.join(&format!("/v2/{}/manifests/{}", repository, reference))
                 .context(error::UrlSnafu)?,
         );
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.auth(request)
+            .header("Accept", MANIFEST_ACCEPT)
+            .send()
+            .await
+            .context(error::RequestSnafu)
     }
 
     async fn get_manifest(&self, uri: &Url, repository: &str, reference: &str) -> Result<Response> {
@@ -241,7 +255,11 @@ impl RegistryClientImpl for SimpleRegistryClient {
             uri.join(&format!("/v2/{}/manifests/{}", repository, reference))
                 .context(error::UrlSnafu)?,
         );
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.auth(request)
+            .header("Accept", MANIFEST_ACCEPT)
+            .send()
+            .await
+            .context(error::RequestSnafu)
     }
 
     async fn put_manifest(

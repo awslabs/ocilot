@@ -1,9 +1,9 @@
 use clap::Parser;
 use ocilot::error;
-use ocilot::index::Index;
+use ocilot::manifest::Manifest as OciManifest;
 use ocilot::models::Platform;
 use ocilot::uri::Uri;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 use super::context::Ctx;
 
@@ -23,8 +23,17 @@ impl Manifest {
         let mut uri = Uri::new(self.url.as_str()).await?;
         uri.set_secure(!self.insecure);
         let platform: Option<Platform> = self.platform.clone().map(|x| x.parse()).transpose()?;
-        let index = Index::fetch(&uri).await?;
-        let image = index.fetch_image(&uri, platform).await?;
+
+        // The reference may resolve to either an image index (manifest list)
+        // or an image manifest. Dispatch on `mediaType` so we deserialize
+        // into the right shape rather than blindly assuming an index.
+        let image = match OciManifest::fetch(&uri).await? {
+            OciManifest::Index(index) => index
+                .fetch_image(&uri, platform)
+                .await?
+                .context(error::ImageNotFoundSnafu { uri: uri.clone() })?,
+            OciManifest::Image(image) => image,
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&image).context(error::SerializeSnafu)?

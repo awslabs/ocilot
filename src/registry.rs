@@ -254,6 +254,20 @@ impl Registry {
     where
         T: DeserializeOwned,
     {
+        let value = self.fetch_manifest_value(repository, reference).await?;
+        serde_json::from_value(value).context(error::BodyDeserializeSnafu)
+    }
+
+    /// Fetch a manifest from the registry as a raw [`serde_json::Value`].
+    ///
+    /// This is useful for callers that need to inspect the `mediaType` field
+    /// before deciding how to deserialize the manifest (e.g. an [`Index`]
+    /// vs. an [`Image`]).
+    pub(crate) async fn fetch_manifest_value(
+        &self,
+        repository: &str,
+        reference: &str,
+    ) -> Result<serde_json::Value> {
         let repository = self.repository_name(repository);
         let response = self
             .client
@@ -269,7 +283,16 @@ impl Registry {
                     .context(error::ErrorDeserializeSnafu)?
             }
         );
-        Self::body(response).await
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .context(error::ResponseDeserializeSnafu)?;
+        if tracing::enabled!(tracing::Level::TRACE)
+            && let Ok(pretty) = serde_json::to_string_pretty(&value)
+        {
+            trace!(target: "registry", "RESPONSE BODY: {}", pretty);
+        }
+        Ok(value)
     }
 
     /// Push a manifest to the oci registtry

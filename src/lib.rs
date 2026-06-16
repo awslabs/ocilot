@@ -15,6 +15,8 @@ pub mod image;
 pub mod index;
 /// Layer read/write operations.
 pub mod layer;
+/// Typed manifest dispatch (index vs image).
+pub mod manifest;
 /// OCI specification model types.
 pub mod models;
 /// Optional progress reporting trait.
