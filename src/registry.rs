@@ -1,7 +1,8 @@
 use crate::client::RegistryClient;
 use crate::layer::Layer;
 use crate::models::{
-    DockerConfig, ErrorResponse, MediaType, Platform, RepositoryList, TagList, Token,
+    DockerConfig, ErrorCode, ErrorInfo, ErrorResponse, MediaType, Platform, RepositoryList,
+    TagList, Token,
 };
 use crate::uri::RegistryUri;
 use crate::{Result, error};
@@ -56,12 +57,12 @@ impl Registry {
                         .await
                         .inspect_err(|e| error!("public ecr: {:?}", e))
                         .context(error::EcrPublicAuthSnafu)?;
-                    trace!(target: "registry", "public ecr authorization response: {:?}", ecr_response);
+                    trace!(target: "registry", "public ecr authorization response received (token redacted)");
                     is_ecr = true;
                     token = ecr_response.authorization_data()
                         .and_then(|x| x.authorization_token.clone()
                         .map(Token::Bearer));
-                } else if uri.base().contains("ecr") {
+                } else if uri.base().contains(".dkr.ecr.") && uri.base().ends_with(".amazonaws.com") {
                     debug!(target: "registry", "using private ecr");
                     let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
                     let ecr_client = aws_sdk_ecr::Client::new(&sdk_config);
@@ -70,7 +71,7 @@ impl Registry {
                         .send()
                         .await
                         .context(error::EcrPrivateAuthSnafu)?;
-                    trace!(target: "registry", "private ecr authorization response: {:?}", ecr_response);
+                    trace!(target: "registry", "private ecr authorization response received (token redacted)");
                     if let Some(authorization_token) = ecr_response.authorization_data().first().and_then(|x| x.authorization_token()) {
                         let decoded = base64::engine::general_purpose::STANDARD
                             .decode(authorization_token)
@@ -159,10 +160,7 @@ impl Registry {
         ensure!(
             response.status().is_success(),
             error::ListReposSnafu {
-                reason: response
-                    .json::<ErrorResponse>()
-                    .await
-                    .context(error::ErrorDeserializeSnafu)?
+                reason: error_response(response).await
             }
         );
         let list: RepositoryList = Self::body(response).await?;
@@ -198,10 +196,7 @@ impl Registry {
         ensure!(
             response.status().is_success(),
             error::FetchBlobSnafu {
-                reason: response
-                    .json::<ErrorResponse>()
-                    .await
-                    .context(error::ErrorDeserializeSnafu)?
+                reason: error_response(response).await
             }
         );
         let size: u64 = response
@@ -228,10 +223,7 @@ impl Registry {
             response.status().is_success(),
             error::DeleteBlobSnafu {
                 digest,
-                reason: response
-                    .json::<ErrorResponse>()
-                    .await
-                    .context(error::ErrorDeserializeSnafu)?
+                reason: error_response(response).await
             }
         );
         Ok(())
@@ -276,10 +268,7 @@ impl Registry {
         ensure!(
             response.status().is_success(),
             error::FetchManifestSnafu {
-                reason: response
-                    .json::<ErrorResponse>()
-                    .await
-                    .context(error::ErrorDeserializeSnafu)?
+                reason: error_response(response).await
             }
         );
         let value: serde_json::Value = response
@@ -325,10 +314,7 @@ impl Registry {
             response.status().is_success(),
             error::PushImageSnafu {
                 uri: self.url()?.clone(),
-                reason: response
-                    .json::<ErrorResponse>()
-                    .await
-                    .context(error::ErrorDeserializeSnafu)?
+                reason: error_response(response).await
             }
         );
         Ok(Layer::builder()
@@ -350,10 +336,7 @@ impl Registry {
         ensure!(
             response.status().is_success(),
             error::ListTagsSnafu {
-                reason: response
-                    .json::<ErrorResponse>()
-                    .await
-                    .context(error::ErrorDeserializeSnafu)?
+                reason: error_response(response).await
             }
         );
         let taglist: TagList = Self::body(response).await?;
@@ -374,10 +357,7 @@ impl Registry {
             response.status().is_success(),
             error::DeleteTagSnafu {
                 tag: tag.to_string(),
-                reason: response
-                    .json::<ErrorResponse>()
-                    .await
-                    .context(error::ErrorDeserializeSnafu)?
+                reason: error_response(response).await
             }
         );
 
@@ -400,6 +380,25 @@ impl Registry {
         }
         serde_json::from_value(value).context(error::BodyDeserializeSnafu)
     }
+}
+
+/// Convert a non-success HTTP response into an [`ErrorResponse`], falling
+/// back to a synthetic entry carrying the raw HTTP status/body when the
+/// response isn't valid OCI distribution error JSON. Non-2xx responses from
+/// proxies/load balancers/WAFs sitting in front of a registry commonly
+/// return plain text, HTML, or an empty body rather than the OCI error
+/// schema; without this fallback that body would fail to deserialize and
+/// mask the real HTTP status behind a generic deserialize error.
+async fn error_response(response: Response) -> ErrorResponse {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    serde_json::from_str::<ErrorResponse>(&text).unwrap_or_else(|_| ErrorResponse {
+        errors: vec![ErrorInfo {
+            code: ErrorCode::Unsupported,
+            message: Some(format!("HTTP {status}")),
+            detail: (!text.trim().is_empty()).then_some(text),
+        }],
+    })
 }
 
 /// Read a single docker/finch config file and resolve any matching auth

@@ -50,7 +50,7 @@ impl Serialize for MediaType {
             Self::Config => "application/vnd.oci.image.config.v1+json".into(),
             Self::Layer(compression) => format!(
                 "application/vnd.oci.image.layer.v1.tar{}",
-                compression.to_ext()
+                compression.to_oci_suffix()
             ),
             Self::DockerManifestList => {
                 "application/vnd.docker.distribution.manifest.list.v2+json".into()
@@ -59,7 +59,7 @@ impl Serialize for MediaType {
             Self::DockerContainerImage => "application/vnd.docker.container.image.v1+json".into(),
             Self::DockerImageRootfs(compression) => format!(
                 "application/vnd.docker.image.rootfs.diff.tar{}",
-                compression.to_ext()
+                compression.to_docker_suffix()
             ),
         };
         serializer.serialize_str(string.as_str())
@@ -122,22 +122,36 @@ pub enum Compression {
 }
 
 impl Compression {
+    /// Detect the compression algorithm encoded in a media type string.
+    ///
+    /// Real-world media types use two different suffix conventions:
+    /// - OCI spec: `+gzip` / `+zstd` (e.g. `application/vnd.oci.image.layer.v1.tar+gzip`)
+    /// - Docker schema2: `.gzip` (full word, e.g. `...rootfs.diff.tar.gzip`)
+    ///
+    /// We accept both, plus the short dotted forms (`.gz`/`.zst`) for
+    /// leniency with non-standard producers.
     pub fn new(string: &str) -> Self {
-        if string.ends_with(".gz") || string.ends_with(".gzip2") {
+        if string.ends_with("+gzip") || string.ends_with(".gzip") || string.ends_with(".gz") {
             Compression::Gzip
-        } else if string.ends_with(".xz") {
-            Compression::Xz
-        } else if string.ends_with(".lz4") {
-            Compression::Lz4
-        } else if string.ends_with(".zst") {
+        } else if string.ends_with("+zstd") || string.ends_with(".zstd") || string.ends_with(".zst")
+        {
             Compression::Zstd
-        } else if string.ends_with(".bz2") || string.ends_with(".bzip2") {
+        } else if string.ends_with("+xz") || string.ends_with(".xz") {
+            Compression::Xz
+        } else if string.ends_with("+lz4") || string.ends_with(".lz4") {
+            Compression::Lz4
+        } else if string.ends_with("+bzip2")
+            || string.ends_with(".bzip2")
+            || string.ends_with(".bz2")
+        {
             Compression::Bzip2
         } else {
             Compression::None
         }
     }
 
+    /// File extension used for on-disk tarball filenames (e.g. `export`),
+    /// independent of media-type serialization conventions.
     pub fn to_ext(&self) -> &str {
         match self {
             Self::Gzip => ".gz",
@@ -145,6 +159,30 @@ impl Compression {
             Self::Lz4 => ".lz4",
             Self::Xz => ".xz",
             Self::Zstd => ".zst",
+            Self::None => "",
+        }
+    }
+
+    /// Suffix used when serializing an OCI `application/vnd.oci.image.layer.v1.tar*` media type.
+    pub fn to_oci_suffix(&self) -> &str {
+        match self {
+            Self::Gzip => "+gzip",
+            Self::Bzip2 => "+bzip2",
+            Self::Lz4 => "+lz4",
+            Self::Xz => "+xz",
+            Self::Zstd => "+zstd",
+            Self::None => "",
+        }
+    }
+
+    /// Suffix used when serializing a Docker `application/vnd.docker.image.rootfs.diff.tar*` media type.
+    pub fn to_docker_suffix(&self) -> &str {
+        match self {
+            Self::Gzip => ".gzip",
+            Self::Bzip2 => ".bzip2",
+            Self::Lz4 => ".lz4",
+            Self::Xz => ".xz",
+            Self::Zstd => ".zstd",
             Self::None => "",
         }
     }
@@ -176,7 +214,8 @@ pub struct Platform {
 impl Default for Platform {
     fn default() -> Self {
         let arch = match consts::ARCH {
-            "arm" | "aarch64" | "longaarch64" => "arm64",
+            "arm" | "aarch64" => "arm64",
+            "loongarch64" => "loong64",
             _ => "amd64",
         };
         Self {
@@ -258,8 +297,10 @@ pub struct History {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<Timestamp>,
     #[builder(into)]
+    #[serde(default)]
     pub created_by: String,
     #[builder(into)]
+    #[serde(default)]
     pub comment: String,
     #[builder(into)]
     #[serde(default)]
@@ -357,7 +398,7 @@ impl fmt::Display for ErrorInfo {
         } else if let Some(detail) = self.detail.as_ref() {
             detail.clone()
         } else {
-            "unknown error occured".to_string()
+            "unknown error occurred".to_string()
         };
         let code = match self.code {
             ErrorCode::BlobUnknown => "blob unknown",
@@ -398,10 +439,27 @@ impl fmt::Display for ErrorResponse {
 }
 
 /// Represents an authorization token
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Token {
     Bearer(String),
     Basic { username: String, password: String },
+}
+
+impl fmt::Debug for Token {
+    /// Manual `Debug` impl that redacts the secret so that any accidental
+    /// `{:?}` logging (directly, or transitively through `Registry`/`Uri`/
+    /// `Error`) never leaks credentials.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Token::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            Token::Basic { username, .. } => {
+                write!(
+                    f,
+                    "Basic {{ username: {username:?}, password: <redacted> }}"
+                )
+            }
+        }
+    }
 }
 
 impl Token {
@@ -489,5 +547,54 @@ mod tests {
     fn platform_try_from_string_round_trips_display() {
         let p = Platform::try_from("linux/arm64".to_string()).unwrap();
         assert_eq!(p.to_string(), "linux/arm64");
+    }
+
+    #[test]
+    fn compression_detects_real_oci_and_docker_media_types() {
+        // OCI spec uses `+gzip`/`+zstd` suffixes.
+        assert_eq!(
+            Compression::new("application/vnd.oci.image.layer.v1.tar+gzip"),
+            Compression::Gzip
+        );
+        assert_eq!(
+            Compression::new("application/vnd.oci.image.layer.v1.tar+zstd"),
+            Compression::Zstd
+        );
+        // Docker schema2 uses the full word with a dot separator.
+        assert_eq!(
+            Compression::new("application/vnd.docker.image.rootfs.diff.tar.gzip"),
+            Compression::Gzip
+        );
+        // Uncompressed layers should not be misdetected.
+        assert_eq!(
+            Compression::new("application/vnd.oci.image.layer.v1.tar"),
+            Compression::None
+        );
+    }
+
+    #[test]
+    fn media_type_layer_round_trips_through_json() {
+        for compression in [Compression::Gzip, Compression::Zstd, Compression::None] {
+            let media = MediaType::Layer(compression.clone());
+            let json = serde_json::to_string(&media).unwrap();
+            let parsed: MediaType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, media, "round trip failed for {json}");
+        }
+        // Spot-check the actual wire format matches the OCI spec.
+        let json = serde_json::to_string(&MediaType::Layer(Compression::Gzip)).unwrap();
+        assert_eq!(json, "\"application/vnd.oci.image.layer.v1.tar+gzip\"");
+    }
+
+    #[test]
+    fn token_debug_redacts_secrets() {
+        let bearer = Token::Bearer("super-secret-token".to_string());
+        assert!(!format!("{bearer:?}").contains("super-secret-token"));
+        let basic = Token::Basic {
+            username: "AWS".to_string(),
+            password: "super-secret-password".to_string(),
+        };
+        let debug = format!("{basic:?}");
+        assert!(!debug.contains("super-secret-password"));
+        assert!(debug.contains("AWS"));
     }
 }

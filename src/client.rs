@@ -107,6 +107,30 @@ impl SimpleRegistryClient {
     }
 }
 
+/// Build a `/v2/...` URL from literal + dynamic path segments.
+///
+/// Unlike `format!("/v2/{repo}/blobs/{digest}")` followed by `Url::join`,
+/// this percent-encodes each segment independently via `path_segments_mut`
+/// and never interprets `/`, `..`, `?`, or `#` inside a segment specially.
+/// That matters because `repository`/`digest`/`reference` values can
+/// originate from untrusted registry responses (e.g. a manifest digest read
+/// back from a third-party registry during `copy`); without this, such a
+/// value could inject extra path segments or otherwise redirect the request
+/// to an unintended endpoint on the same host.
+fn v2_url<'a>(base: &Url, segments: impl IntoIterator<Item = &'a str>) -> Result<Url> {
+    let mut url = base.join("/v2/").context(error::UrlSnafu)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| error::Error::Internal {
+                context: "registry url cannot be used as a base for path segments",
+            })?;
+        path.pop_if_empty();
+        path.extend(segments);
+    }
+    Ok(url)
+}
+
 #[async_trait]
 impl RegistryClientImpl for SimpleRegistryClient {
     async fn catalog(&self, uri: &Url) -> Result<Response> {
@@ -117,34 +141,30 @@ impl RegistryClientImpl for SimpleRegistryClient {
     }
 
     async fn head_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response> {
-        let request = self.client.head(
-            uri.join(&format!("/v2/{}/blobs/{}", repository, digest))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self
+            .client
+            .head(v2_url(uri, repository.split('/').chain(["blobs", digest]))?);
         self.auth(request).send().await.context(error::RequestSnafu)
     }
 
     async fn get_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response> {
-        let request = self.client.get(
-            uri.join(&format!("/v2/{}/blobs/{}", repository, digest))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self
+            .client
+            .get(v2_url(uri, repository.split('/').chain(["blobs", digest]))?);
         self.auth(request).send().await.context(error::RequestSnafu)
     }
 
     async fn del_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response> {
-        let request = self.client.delete(
-            uri.join(&format!("/v2/{}/blobs/{}", repository, digest))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self
+            .client
+            .delete(v2_url(uri, repository.split('/').chain(["blobs", digest]))?);
         self.auth(request).send().await.context(error::RequestSnafu)
     }
 
     async fn get_tags(&self, uri: &Url, repository: &str) -> Result<Response> {
-        let request = self.client.get(
-            uri.join(&format!("/v2/{}/tags/list", repository))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self
+            .client
+            .get(v2_url(uri, repository.split('/').chain(["tags", "list"]))?);
         self.auth(request).send().await.context(error::RequestSnafu)
     }
 
@@ -155,10 +175,8 @@ impl RegistryClientImpl for SimpleRegistryClient {
         data: Bytes,
         digest: &str,
     ) -> Result<Response> {
-        let mut uri = uri
-            .join(&format!("/v2/{}/blobs/uploads/", repository))
-            .context(error::UrlSnafu)?;
-        uri.set_query(Some(format!("digest={digest}").as_str()));
+        let mut uri = v2_url(uri, repository.split('/').chain(["blobs", "uploads", ""]))?;
+        uri.query_pairs_mut().append_pair("digest", digest);
         let request = self.client.post(uri);
         self.auth(request)
             .header("Content-Type", "application/octet-stream")
@@ -170,10 +188,10 @@ impl RegistryClientImpl for SimpleRegistryClient {
     }
 
     async fn start_upload(&self, uri: &Url, repository: &str) -> Result<Response> {
-        let request = self.client.post(
-            uri.join(&format!("/v2/{}/blobs/uploads/", repository))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self.client.post(v2_url(
+            uri,
+            repository.split('/').chain(["blobs", "uploads", ""]),
+        )?);
         self.auth(request)
             .header("Content-Length", 0)
             .send()
@@ -239,10 +257,10 @@ impl RegistryClientImpl for SimpleRegistryClient {
         repository: &str,
         reference: &str,
     ) -> Result<Response> {
-        let request = self.client.head(
-            uri.join(&format!("/v2/{}/manifests/{}", repository, reference))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self.client.head(v2_url(
+            uri,
+            repository.split('/').chain(["manifests", reference]),
+        )?);
         self.auth(request)
             .header("Accept", MANIFEST_ACCEPT)
             .send()
@@ -251,10 +269,10 @@ impl RegistryClientImpl for SimpleRegistryClient {
     }
 
     async fn get_manifest(&self, uri: &Url, repository: &str, reference: &str) -> Result<Response> {
-        let request = self.client.get(
-            uri.join(&format!("/v2/{}/manifests/{}", repository, reference))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self.client.get(v2_url(
+            uri,
+            repository.split('/').chain(["manifests", reference]),
+        )?);
         self.auth(request)
             .header("Accept", MANIFEST_ACCEPT)
             .send()
@@ -269,10 +287,10 @@ impl RegistryClientImpl for SimpleRegistryClient {
         reference: &str,
         body: Bytes,
     ) -> Result<Response> {
-        let request = self.client.put(
-            uri.join(&format!("/v2/{}/manifests/{}", repository, reference))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self.client.put(v2_url(
+            uri,
+            repository.split('/').chain(["manifests", reference]),
+        )?);
         self.auth(request)
             .body(body)
             .send()
@@ -281,10 +299,10 @@ impl RegistryClientImpl for SimpleRegistryClient {
     }
 
     async fn del_manifest(&self, uri: &Url, repository: &str, reference: &str) -> Result<Response> {
-        let request = self.client.delete(
-            uri.join(&format!("/v2/{}/manifests/{}", repository, reference))
-                .context(error::UrlSnafu)?,
-        );
+        let request = self.client.delete(v2_url(
+            uri,
+            repository.split('/').chain(["manifests", reference]),
+        )?);
         self.auth(request).send().await.context(error::RequestSnafu)
     }
 }
@@ -439,4 +457,39 @@ pub(crate) fn extract_location(response: &Response, base: &Url) -> crate::Result
 #[allow(dead_code)]
 pub(crate) fn validate_digest(digest: &str) -> crate::Result<Digest> {
     Digest::parse(digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_url_builds_expected_path() {
+        let base = Url::parse("https://registry.example.com").unwrap();
+        let url = v2_url(&base, "org/app".split('/').chain(["blobs", "sha256:abc"])).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://registry.example.com/v2/org/app/blobs/sha256:abc"
+        );
+    }
+
+    #[test]
+    fn v2_url_percent_encodes_untrusted_segments() {
+        // A malicious/compromised registry could return a digest-shaped
+        // value containing path-traversal or path-injection characters.
+        // Each segment must stay confined to a single percent-encoded path
+        // component rather than being able to introduce extra segments.
+        let base = Url::parse("https://registry.example.com").unwrap();
+        let malicious_digest = "sha256:../../../etc/passwd";
+        let url = v2_url(
+            &base,
+            "org/app".split('/').chain(["blobs", malicious_digest]),
+        )
+        .unwrap();
+        // The traversal characters are percent-encoded within the final
+        // path segment, so the request cannot escape /v2/org/app/blobs/.
+        assert!(url.path().starts_with("/v2/org/app/blobs/"));
+        assert_eq!(url.path_segments().unwrap().count(), 5);
+        assert!(!url.path().contains("/etc/passwd"));
+    }
 }
