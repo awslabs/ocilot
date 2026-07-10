@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use clap::Parser;
+use snafu::OptionExt;
 
 use ocilot::error;
 use ocilot::registry::Registry;
@@ -20,10 +21,13 @@ pub struct List {
 
 impl List {
     pub async fn run(&self, _ctx: &Ctx) -> Result<(), error::Error> {
-        let mut segments: Vec<_> = self.url.split("/").collect();
-        let object = segments.pop().unwrap();
-        let registry = segments.join("/");
-        let mut registry_uri = RegistryUri::from_str(registry.as_str())?;
+        // Split like `Uri::new` does: only the first path segment is the
+        // registry, everything after it is the (possibly multi-segment)
+        // repository name.
+        let (registry, object) = self.url.split_once('/').context(error::MalformedUriSnafu {
+            reason: "expected <registry>/<repository>",
+        })?;
+        let mut registry_uri = RegistryUri::from_str(registry)?;
         if self.insecure {
             registry_uri.set_secure(false);
         }

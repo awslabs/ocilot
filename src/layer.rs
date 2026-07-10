@@ -723,15 +723,15 @@ impl AsyncWrite for Writer {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 },
                 WriterState::Initial => {
-                    // No upload was started. Either the blob fit in the
-                    // buffer (single POST) or we have an empty blob.
-                    if !this.buffer.is_empty() {
-                        this.launch_monolithic_post();
-                        continue;
-                    }
-                    // Empty blob: no chunks to send. Mark Done.
-                    this.state = WriterState::Done;
-                    return Poll::Ready(Ok(()));
+                    // No upload was started yet. Always issue a (possibly
+                    // zero-length) monolithic POST rather than assuming an
+                    // empty blob is already present on the registry: the
+                    // digest was already confirmed absent by `check_blob`
+                    // in `Layer::create`, so skipping the request here
+                    // would mark the writer `Done` without ever actually
+                    // persisting the blob.
+                    this.launch_monolithic_post();
+                    continue;
                 }
                 WriterState::Idle { .. } => {
                     // Drain any remaining buffer through PUT.
