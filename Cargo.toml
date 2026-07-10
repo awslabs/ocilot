@@ -44,7 +44,7 @@ aws-sdk-ecrpublic = { version = "1", default-features = false, features = [
 base16 = "0.2"
 base64 = "0.22"
 bon = "3"
-bytes = "1.11"
+bytes = "1.12"
 cfg-if = "1.0"
 jiff = { version = "0.2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -52,6 +52,7 @@ futures = "0.3"
 indicatif = { version = "0.18", optional = true }
 home = "0.5"
 keyring = "4.1"
+keyring-core = "1"
 reqwest = { version = "0.13", features = [
     "json",
     "stream",
