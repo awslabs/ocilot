@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::digest::Digest;
 use crate::models::Token;
 use crate::{Result, error};
 use async_trait::async_trait;
@@ -451,12 +450,6 @@ pub(crate) fn extract_location(response: &Response, base: &Url) -> crate::Result
         .to_str()
         .context(error::ImproperHeaderSnafu)?;
     base.join(header).context(error::UrlSnafu)
-}
-
-/// Convenience: validate a digest string and return the canonical form.
-#[allow(dead_code)]
-pub(crate) fn validate_digest(digest: &str) -> crate::Result<Digest> {
-    Digest::parse(digest)
 }
 
 #[cfg(test)]

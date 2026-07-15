@@ -65,14 +65,14 @@ impl FromStr for RegistryUri {
     }
 }
 
-impl TryInto<Url> for RegistryUri {
+impl TryFrom<RegistryUri> for Url {
     type Error = crate::error::Error;
 
-    fn try_into(self) -> Result<Url, Self::Error> {
+    fn try_from(value: RegistryUri) -> Result<Self, Self::Error> {
         Url::parse(&format!(
             "{}://{}",
-            if self.is_secure { "https" } else { "http" },
-            self.base
+            if value.is_secure { "https" } else { "http" },
+            value.base
         ))
         .context(crate::error::UrlSnafu)
     }
@@ -84,7 +84,7 @@ impl Uri {
         let (registry, object) = input.split_once("/").context(error::MalformedUriSnafu {
             reason: "only a registry was provided in the uri",
         })?;
-        let (repository, tag) = if object.contains('@') {
+        let (repository, reference) = if object.contains('@') {
             let (repository, digest) = object.split_once('@').unwrap();
             let (algorithm, value) = digest.split_once(':').context(error::MalformedUriSnafu {
                 reason: "no algorithm was provided for the digest",
@@ -105,7 +105,7 @@ impl Uri {
         Ok(Self {
             registry: Registry::new(&RegistryUri::from_str(registry)?).await?,
             repository: repository.into(),
-            reference: tag,
+            reference,
         })
     }
 

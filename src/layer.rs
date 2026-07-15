@@ -10,7 +10,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use snafu::{ResultExt, ensure};
 use std::cmp::min;
 use std::pin::Pin;
@@ -23,6 +23,49 @@ use url::Url;
 const MIN_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 /// Maximum chunk size for layer operations (100 MiB).
 const MAX_CHUNK_SIZE: usize = 100 * 1024 * 1024;
+
+/// A hasher that dispatches to whichever digest algorithm matches a target
+/// digest string, so verification/creation isn't hardcoded to SHA-256 (the
+/// OCI spec also permits `sha512:` digests).
+#[derive(Clone)]
+enum AnyDigest {
+    Sha256(Sha256),
+    Sha512(Sha512),
+}
+
+impl AnyDigest {
+    /// Pick a hasher matching the algorithm named in `digest` (e.g.
+    /// `sha512:...`). Defaults to SHA-256 when no algorithm prefix is
+    /// present, but errors out on a recognized-but-unsupported prefix (e.g.
+    /// `sha384:`) instead of silently hashing with SHA-256 and letting it
+    /// surface later as a misleading digest mismatch.
+    fn for_digest(digest: Option<&str>) -> crate::Result<Self> {
+        match digest.and_then(|d| d.split_once(':')).map(|(algo, _)| algo) {
+            None | Some("sha256") => Ok(Self::Sha256(Sha256::new())),
+            Some("sha512") => Ok(Self::Sha512(Sha512::new())),
+            Some(other) => error::InvalidAlgorithmSnafu {
+                algorithm: other.to_string(),
+            }
+            .fail(),
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha256(h) => h.update(data),
+            Self::Sha512(h) => h.update(data),
+        }
+    }
+
+    /// Finalize (without consuming, so callers can keep hashing) into the
+    /// canonical `algorithm:hex` digest string.
+    fn finalize_digest_string(&self) -> String {
+        match self {
+            Self::Sha256(h) => format!("sha256:{}", base16::encode_lower(&h.clone().finalize())),
+            Self::Sha512(h) => format!("sha512:{}", base16::encode_lower(&h.clone().finalize())),
+        }
+    }
+}
 
 /// A layer represents a blob or sub-object associated with an image.
 ///
@@ -120,7 +163,7 @@ impl Layer {
             size,
             media_type: media_type.clone(),
             state: WriterState::Initial,
-            digest: Sha256::new(),
+            digest: AnyDigest::for_digest(digest.as_deref())?,
             written: 0,
             buffer: Vec::new(),
             progress: handle,
@@ -157,12 +200,12 @@ impl Layer {
             None => Box::new(NoopHandle),
         };
         let stream_reader = StreamReader::new(stream);
-        Ok(Reader::new(
+        Reader::new(
             stream_reader,
             handle,
             Some(self.digest.clone()),
             Some(self.size),
-        ))
+        )
     }
 
     /// Open a layer for reading at the specified URI (used for raw blob
@@ -177,12 +220,7 @@ impl Layer {
             .registry()
             .fetch_blob(uri.repository(), digest.as_str())
             .await?;
-        Ok(Reader::new(
-            StreamReader::new(stream),
-            Box::new(NoopHandle),
-            None,
-            None,
-        ))
+        Reader::new(StreamReader::new(stream), Box::new(NoopHandle), None, None)
     }
 
     /// Media type of the layer
@@ -221,7 +259,7 @@ pub struct Reader {
     /// Expected digest of the streamed bytes; verified at EOF when set.
     expected_digest: Option<String>,
     expected_size: Option<usize>,
-    hasher: Sha256,
+    hasher: AnyDigest,
     bytes_read: usize,
     /// Set to true after we've validated the final digest at EOF, so we
     /// don't run validation twice.
@@ -236,16 +274,17 @@ impl Reader {
         progress: Box<dyn ProgressHandle>,
         expected_digest: Option<String>,
         expected_size: Option<usize>,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        let hasher = AnyDigest::for_digest(expected_digest.as_deref())?;
+        Ok(Self {
             inner: Box::pin(inner),
             progress,
             expected_digest,
             expected_size,
-            hasher: Sha256::new(),
+            hasher,
             bytes_read: 0,
             finalized: false,
-        }
+        })
     }
 }
 
@@ -274,10 +313,12 @@ impl AsyncRead for Reader {
                     if let Some(expected) = this.expected_size
                         && this.bytes_read > expected
                     {
-                        return Poll::Ready(Err(std::io::Error::other(format!(
-                            "registry returned more bytes than declared (expected {expected}, got {})",
-                            this.bytes_read
-                        ))));
+                        return Poll::Ready(Err(std::io::Error::other(
+                            error::Error::LayerSizeMismatch {
+                                expected,
+                                actual: this.bytes_read,
+                            },
+                        )));
                     }
                     this.progress.inc(delta as u64);
                 } else if !this.finalized {
@@ -286,20 +327,22 @@ impl AsyncRead for Reader {
                     if let Some(expected) = this.expected_size
                         && this.bytes_read != expected
                     {
-                        return Poll::Ready(Err(std::io::Error::other(format!(
-                            "short layer read (expected {expected}, got {})",
-                            this.bytes_read
-                        ))));
+                        return Poll::Ready(Err(std::io::Error::other(
+                            error::Error::LayerSizeMismatch {
+                                expected,
+                                actual: this.bytes_read,
+                            },
+                        )));
                     }
                     if let Some(expected) = this.expected_digest.as_ref() {
-                        let computed = format!(
-                            "sha256:{}",
-                            base16::encode_lower(this.hasher.clone().finalize().as_slice())
-                        );
+                        let computed = this.hasher.finalize_digest_string();
                         if computed != *expected {
-                            return Poll::Ready(Err(std::io::Error::other(format!(
-                                "layer digest mismatch: expected {expected}, computed {computed}"
-                            ))));
+                            return Poll::Ready(Err(std::io::Error::other(
+                                error::Error::DigestMismatch {
+                                    expected: expected.clone(),
+                                    actual: computed,
+                                },
+                            )));
                         }
                     }
                 }
@@ -323,7 +366,7 @@ pub struct Writer {
     size: usize,
     /// Bytes the registry has confirmed accepted.
     written: usize,
-    digest: Sha256,
+    digest: AnyDigest,
     state: WriterState,
     /// Buffer of bytes that have been logically accepted from the caller
     /// but not yet flushed/uploaded.
@@ -365,8 +408,7 @@ impl Writer {
                 source: std::io::Error::other("writer.layer() called before shutdown"),
             });
         }
-        let digest_bytes = self.digest.clone().finalize();
-        let digest = format!("sha256:{}", base16::encode_lower(&digest_bytes));
+        let digest = self.digest.finalize_digest_string();
         self.progress.finish();
         Ok(Layer {
             media_type: self.media_type.clone(),
@@ -536,8 +578,7 @@ impl Writer {
         if chunk_len > 0 {
             self.digest.update(&chunk);
         }
-        let digest_bytes = self.digest.clone().finalize();
-        let digest = format!("sha256:{}", base16::encode_lower(&digest_bytes));
+        let digest = self.digest.finalize_digest_string();
         let bytes = Bytes::from(chunk);
         let start = self.written;
         let end = start + chunk_len;
@@ -562,8 +603,7 @@ impl Writer {
         let chunk = std::mem::take(&mut self.buffer);
         let chunk_len = chunk.len();
         self.digest.update(&chunk);
-        let digest_bytes = self.digest.clone().finalize();
-        let digest = format!("sha256:{}", base16::encode_lower(&digest_bytes));
+        let digest = self.digest.finalize_digest_string();
         let bytes = Bytes::from(chunk);
         let registry_url = match self.uri.registry().url() {
             Ok(u) => u,
@@ -794,10 +834,29 @@ mod tests {
             Box::new(NoopHandle),
             Some(empty_digest.to_string()),
             Some(0),
-        );
+        )
+        .unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).await.unwrap();
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reader_verifies_sha512_digest() {
+        // Regression test: verification must not hardcode SHA-256, since
+        // sha512-addressed blobs are spec-valid.
+        let data = b"hello world".to_vec();
+        let sha512_digest = "sha512:309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f";
+        let mut r = Reader::new(
+            std::io::Cursor::new(data.clone()),
+            Box::new(NoopHandle),
+            Some(sha512_digest.to_string()),
+            Some(data.len()),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data);
     }
 
     #[tokio::test]
@@ -808,9 +867,29 @@ mod tests {
             Box::new(NoopHandle),
             Some(bad_digest.to_string()),
             Some(0),
-        );
+        )
+        .unwrap();
         let mut out = Vec::new();
         let err = r.read_to_end(&mut out).await.unwrap_err();
         assert!(err.to_string().contains("digest mismatch"));
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_unsupported_digest_algorithm() {
+        // sha384 is a spec-valid prefix syntactically but this crate only
+        // implements sha256/sha512 hashing; it must be rejected up front
+        // instead of silently hashed as sha256 and reported later as a
+        // misleading digest mismatch.
+        let unsupported_digest =
+            "sha384:0000000000000000000000000000000000000000000000000000000000000000";
+        let err = Reader::new(
+            tokio::io::empty(),
+            Box::new(NoopHandle),
+            Some(unsupported_digest.to_string()),
+            Some(0),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(err.to_string().contains("sha384"));
     }
 }

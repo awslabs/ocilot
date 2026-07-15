@@ -122,7 +122,7 @@ impl Index {
                     .repository(uri.repository())
                     .reference(Reference::from_str(oci.digest())?)
                     .build();
-                Ok(Some(Image::fetch(&new_uri, oci.platform().clone()).await?))
+                Ok(Some(Image::fetch(&new_uri, oci.platform()).await?))
             } else {
                 Ok(None)
             }
