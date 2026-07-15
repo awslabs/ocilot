@@ -201,7 +201,6 @@ impl Registry {
         );
         let size: u64 = response
             .headers()
-            .clone()
             .get("Content-Length")
             .context(error::ContentLengthMissingSnafu)?
             .to_str()
