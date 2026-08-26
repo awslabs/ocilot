@@ -17,6 +17,7 @@ compression = ["dep:async-compression"]
 progress = ["dep:indicatif", "dep:tracing-indicatif"]
 
 [dependencies]
+astral-tokio-tar = "0.6"
 async-compression = { version = "0.4", features = [
     "tokio",
     "bzip2",
@@ -42,7 +43,7 @@ aws-sdk-ecrpublic = { version = "1", default-features = false, features = [
     "rt-tokio",
 ], optional = true }
 base16 = "0.2"
-base64 = "0.22"
+base64 = "0.23"
 bon = "3"
 bytes = "1.12"
 cfg-if = "1.0"
@@ -67,5 +68,4 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-indicatif = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-astral-tokio-tar = "0.6"
 url = "2"
