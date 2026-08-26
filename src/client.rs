@@ -73,6 +73,7 @@ pub(crate) trait RegistryClientImpl: Send + Sync + Debug {
         uri: &Url,
         repository: &str,
         reference: &str,
+        content_type: &str,
         body: Bytes,
     ) -> Result<Response>;
     /// DELETE {uri}/v2/{repository}/manifests/{reference}
@@ -284,6 +285,7 @@ impl RegistryClientImpl for SimpleRegistryClient {
         uri: &Url,
         repository: &str,
         reference: &str,
+        content_type: &str,
         body: Bytes,
     ) -> Result<Response> {
         let request = self.client.put(v2_url(
@@ -291,6 +293,8 @@ impl RegistryClientImpl for SimpleRegistryClient {
             repository.split('/').chain(["manifests", reference]),
         )?);
         self.auth(request)
+            .header("Content-Type", content_type)
+            .header("Content-Length", body.len())
             .body(body)
             .send()
             .await
@@ -420,10 +424,17 @@ impl RegistryClient {
         uri: Url,
         repository: String,
         reference: String,
+        content_type: &str,
         body: Bytes,
     ) -> Result<Response> {
         self.client
-            .put_manifest(&uri, repository.as_str(), reference.as_str(), body)
+            .put_manifest(
+                &uri,
+                repository.as_str(),
+                reference.as_str(),
+                content_type,
+                body,
+            )
             .await
     }
 
