@@ -305,6 +305,7 @@ impl Registry {
                 self.url()?,
                 repository,
                 reference.into(),
+                &media_type.to_string(),
                 Bytes::from_owner(bytes),
             )
             .await?;
