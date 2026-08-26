@@ -60,7 +60,7 @@ impl Image {
     pub async fn create(config: &Layer, layers: &[Layer], platform: Option<Platform>) -> Self {
         Self {
             schema_version: 2,
-            media_type: MediaType::Config,
+            media_type: MediaType::Manifest,
             config: config.clone(),
             layers: layers.to_vec(),
             platform,

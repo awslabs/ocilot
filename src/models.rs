@@ -39,12 +39,9 @@ impl MediaType {
     }
 }
 
-impl Serialize for MediaType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let string = match self {
+impl std::fmt::Display for MediaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s: String = match self {
             Self::ImageIndex => "application/vnd.oci.image.index.v1+json".into(),
             Self::Manifest => "application/vnd.oci.image.manifest.v1+json".into(),
             Self::Config => "application/vnd.oci.image.config.v1+json".into(),
@@ -62,7 +59,16 @@ impl Serialize for MediaType {
                 compression.to_docker_suffix()
             ),
         };
-        serializer.serialize_str(string.as_str())
+        f.write_str(&s)
+    }
+}
+
+impl Serialize for MediaType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -583,6 +589,29 @@ mod tests {
         // Spot-check the actual wire format matches the OCI spec.
         let json = serde_json::to_string(&MediaType::Layer(Compression::Gzip)).unwrap();
         assert_eq!(json, "\"application/vnd.oci.image.layer.v1.tar+gzip\"");
+    }
+
+    #[test]
+    fn media_type_display_matches_serialized_form() {
+        // The Display impl feeds the Content-Type header on manifest PUTs, so
+        // it must never drift from the JSON wire format.
+        for media in [
+            MediaType::ImageIndex,
+            MediaType::Manifest,
+            MediaType::Config,
+            MediaType::Layer(Compression::None),
+            MediaType::Layer(Compression::Gzip),
+            MediaType::Layer(Compression::Zstd),
+            MediaType::DockerManifestList,
+            MediaType::DockerManifest,
+            MediaType::DockerContainerImage,
+            MediaType::DockerImageRootfs(Compression::None),
+            MediaType::DockerImageRootfs(Compression::Gzip),
+        ] {
+            let json = serde_json::to_string(&media).unwrap();
+            let expected: String = serde_json::from_str(&json).unwrap();
+            assert_eq!(media.to_string(), expected, "mismatch for {media:?}");
+        }
     }
 
     #[test]
