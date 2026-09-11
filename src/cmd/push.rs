@@ -72,7 +72,7 @@ impl Push {
                 })?;
             let config_size = config_entry
                 .header()
-                .entry_size()
+                .raw_entry_size()
                 .context(error::ArchiveSnafu)?;
 
             let mut writer = Layer::create(
@@ -103,7 +103,7 @@ impl Push {
                         })?;
                     let layer_size = layer_entry
                         .header()
-                        .entry_size()
+                        .raw_entry_size()
                         .context(error::ArchiveSnafu)?;
                     let mut writer = Layer::create(
                         &uri,
