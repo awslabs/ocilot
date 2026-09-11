@@ -1,6 +1,6 @@
 [package]
 name = "ocilot"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "cli and library for interacting with OCI registries"
 license = "MIT OR Apache-2.0"
