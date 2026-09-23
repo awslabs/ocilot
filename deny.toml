@@ -87,8 +87,6 @@ deny = [
 skip = [
   { crate = "base64", reason = "aws-sdk crates still on old version" },
   { crate = "core-foundation", reason = "Multiple copies brought in by keyring + aws-*" },
-  { crate = "http", reason = "Multiple copies brought in by aws-sdk" },
-  { crate = "http-body", reason = "Multiple copies brought in by aws-sdk" },
   { crate = "syn", reason = "Multiple copies brought in as ecosystem moves from 2 -> 3" },
 ]
 skip-tree = [
