@@ -404,9 +404,10 @@ impl Writer {
     /// `shutdown()` has returned `Ready(Ok)`.
     pub async fn layer(&mut self) -> crate::Result<Layer> {
         if !matches!(self.state, WriterState::Done) {
-            return Err(error::Error::LayerWrite {
-                source: std::io::Error::other("writer.layer() called before shutdown"),
-            });
+            // If a write is in-flight call flush and shutdown to make sure data
+            // is stored.
+            self.flush().await.context(error::LayerWriteSnafu)?;
+            self.shutdown().await.context(error::LayerWriteSnafu)?;
         }
         let digest = self.digest.finalize_digest_string();
         self.progress.finish();
