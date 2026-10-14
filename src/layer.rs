@@ -70,7 +70,7 @@ impl AnyDigest {
 
 /// Compute the canonical `algorithm:hex` digest of `data` using the same
 /// algorithm as the `like` digest string (sha256 when unprefixed).
-pub(crate) fn digest_bytes(like: Option<&str>, data: &[u8]) -> crate::Result<String> {
+pub fn digest_bytes(like: Option<&str>, data: &[u8]) -> crate::Result<String> {
     let mut hasher = AnyDigest::for_digest(like)?;
     hasher.update(data);
     Ok(hasher.finalize_digest_string())
