@@ -33,7 +33,10 @@ cargo build --release
 # List images in a repository
 ocilot list myregistry.com/myrepository
 # Pull an image as an oci archive
-ocilot pull myregistry.com/myrepository:latest archive.tar
+ocilot pull --format=oci myregistry.com/myrepository:latest archive.tar
+# Pull an image as an oci archive, recording the reference as the
+# org.opencontainers.image.ref.name annotation (like crane's --annotate-ref)
+ocilot pull --format=oci --annotate-ref myregistry.com/myrepository:latest archive.tar
 # Pull an image with specific platform as a loadable tarball
 ocilot pull --format=tarball myregistry.com/myrepository:latest archive.tar
 # Push an oci image archive to a registry
@@ -55,6 +58,23 @@ ocilot = "0.1.0"
 
 - **progress** - Enable support for logging progress of push and pull operations to progressbars using indicatif
 - **compression** - Enables support for automatically decompressing layers based off media type.
+
+### Writing OCI archives
+
+```rust
+use ocilot::manifest::Manifest;
+use ocilot::oci::OciOptions;
+use ocilot::progress::SharedProgress;
+use ocilot::uri::Uri;
+
+let uri = Uri::new("myregistry.com/myrepository:latest").await?;
+let output = tokio::fs::File::create("archive.tar").await?;
+let options = OciOptions::builder().annotate_ref(true).build();
+Manifest::fetch(&uri)
+    .await?
+    .to_oci(&uri, output, SharedProgress::none(), &options)
+    .await?;
+```
 
 ## Authentication
 

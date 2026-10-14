@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use snafu::{ResultExt, ensure};
 use std::cmp::min;
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -67,6 +68,14 @@ impl AnyDigest {
     }
 }
 
+/// Compute the canonical `algorithm:hex` digest of `data` using the same
+/// algorithm as the `like` digest string (sha256 when unprefixed).
+pub(crate) fn digest_bytes(like: Option<&str>, data: &[u8]) -> crate::Result<String> {
+    let mut hasher = AnyDigest::for_digest(like)?;
+    hasher.update(data);
+    Ok(hasher.finalize_digest_string())
+}
+
 /// A layer represents a blob or sub-object associated with an image.
 ///
 /// Operations for reading or writing blobs operate off this object.
@@ -82,6 +91,9 @@ pub struct Layer {
     #[builder(into)]
     #[serde(skip_serializing_if = "Option::is_none")]
     platform: Option<Platform>,
+    #[builder(into)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    annotations: Option<BTreeMap<String, String>>,
 }
 
 impl Layer {
@@ -243,6 +255,18 @@ impl Layer {
         self.platform.clone()
     }
 
+    /// Arbitrary metadata attached to this descriptor
+    pub fn annotations(&self) -> Option<&BTreeMap<String, String>> {
+        self.annotations.as_ref()
+    }
+
+    /// Insert an annotation on this descriptor, replacing any previous value for the key
+    pub fn set_annotation(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(key.into(), value.into());
+    }
+
     /// Delete this layer from the registry and repository provided by a uri
     pub async fn delete(&self, uri: &Uri) -> crate::Result<()> {
         uri.registry()
@@ -285,6 +309,18 @@ impl Reader {
             bytes_read: 0,
             finalized: false,
         })
+    }
+}
+
+impl Reader {
+    /// Drain the remainder of the stream so the size and digest checks,
+    /// which only run at EOF, are performed. Call after copying exactly the
+    /// expected number of bytes, as [`Layer::copy`] never reads to EOF.
+    pub async fn verify(&mut self) -> crate::Result<()> {
+        tokio::io::copy(self, &mut tokio::io::sink())
+            .await
+            .context(error::LayerReadSnafu)?;
+        Ok(())
     }
 }
 
@@ -416,6 +452,7 @@ impl Writer {
             digest,
             size: self.written,
             platform: None,
+            annotations: None,
         })
     }
 

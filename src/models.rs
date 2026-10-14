@@ -1,7 +1,6 @@
 use base64::Engine;
 use bon::Builder;
 use jiff::Timestamp;
-use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::{OptionExt, ResultExt};
 use std::env::consts;
@@ -9,8 +8,8 @@ use std::str::FromStr;
 use std::{collections::HashMap, fmt};
 
 /// Handles all the supported media type enumerations by this tool.
-/// Since OCI specification allows custom types this is rather limited currently
-/// but should be expanded to treat any unrecognized MediaType as a Custom variant
+/// The OCI specification allows custom types, any unrecognized media type
+/// (e.g. attestation layers) is preserved as [`MediaType::Other`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaType {
     ImageIndex,
@@ -21,6 +20,7 @@ pub enum MediaType {
     DockerManifest,
     DockerContainerImage,
     DockerImageRootfs(Compression),
+    Other(String),
 }
 
 impl MediaType {
@@ -58,6 +58,7 @@ impl std::fmt::Display for MediaType {
                 "application/vnd.docker.image.rootfs.diff.tar{}",
                 compression.to_docker_suffix()
             ),
+            Self::Other(media_type) => media_type.clone(),
         };
         f.write_str(&s)
     }
@@ -98,18 +99,7 @@ impl<'de> Deserialize<'de> for MediaType {
                 "application/vnd.oci.image.manifest.v1+json" => Ok(MediaType::Manifest),
                 "application/vnd.oci.image.index.v1+json" => Ok(MediaType::ImageIndex),
                 "application/vnd.oci.image.config.v1+json" => Ok(MediaType::Config),
-                variant => Err(D::Error::unknown_variant(
-                    variant,
-                    &[
-                        "application/vnd.docker.image.rootfs.diff.tar.*",
-                        "application/vnd.docker.container.image.v1+json",
-                        "application/vnd.docker.distribution.manifest.list.v2+json",
-                        "application/vnd.docker.distribution.manifest.v2+json",
-                        "application/vnd.oci.image.index.v1+json",
-                        "application/vnd.oci.image.manifest.v1+json",
-                        "application/vnd.oci.image.config.v1+json",
-                    ],
-                )),
+                other => Ok(MediaType::Other(other.to_string())),
             }
         }
     }
@@ -607,6 +597,7 @@ mod tests {
             MediaType::DockerContainerImage,
             MediaType::DockerImageRootfs(Compression::None),
             MediaType::DockerImageRootfs(Compression::Gzip),
+            MediaType::Other("application/vnd.in-toto+json".to_string()),
         ] {
             let json = serde_json::to_string(&media).unwrap();
             let expected: String = serde_json::from_str(&json).unwrap();
