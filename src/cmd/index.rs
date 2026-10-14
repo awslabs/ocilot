@@ -1,12 +1,11 @@
 use clap::Parser;
 use ocilot::error;
-use ocilot::layer::Layer;
+use ocilot::layer::{Layer, digest_bytes};
 use ocilot::manifest::Manifest;
 use ocilot::models::Platform;
 use ocilot::uri::Reference;
 use ocilot::uri::Uri;
 use ocilot::{image::Image, index::Index};
-use sha2::{Digest, Sha256};
 use snafu::OptionExt;
 use snafu::ResultExt;
 
@@ -124,9 +123,10 @@ impl AddIndex {
         } else {
             Image::fetch(&source, None).await?
         };
-        let image_bytes = serde_json::to_vec(&image).context(error::SerializeSnafu)?;
-        let hash = Sha256::digest(image_bytes.as_slice());
-        let digest = format!("sha256:{}", base16::encode_lower(hash.as_slice()));
+        // Describe the manifest by the bytes `Image::push` sends, so the
+        // descriptor matches what the registry stored.
+        let image_bytes = image.manifest_bytes()?;
+        let digest = digest_bytes(None, &image_bytes)?;
         let layer = Layer::builder()
             .media_type(image.media_type().clone())
             .digest(digest.clone())

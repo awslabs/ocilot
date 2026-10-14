@@ -72,7 +72,7 @@ impl Image {
 
     /// Manifest bytes: the original bytes when available, otherwise this
     /// manifest serialized.
-    pub(crate) fn manifest_bytes(&self) -> crate::Result<Bytes> {
+    pub fn manifest_bytes(&self) -> crate::Result<Bytes> {
         match &self.raw {
             Some(raw) => Ok(raw.clone()),
             None => Ok(serde_json::to_vec(self)
@@ -298,14 +298,15 @@ impl Image {
         layout.finish(uri, root, options, output).await
     }
 
-    /// Push this image to an oci registry
+    /// Push this image to an oci registry. Manifests that were fetched or
+    /// read are pushed with their original bytes so their digest is kept.
     pub async fn push(&self, uri: &Uri) -> crate::Result<Layer> {
         uri.registry()
             .push_manifest(
                 &self.media_type,
                 uri.repository(),
                 uri.reference().to_string().as_str(),
-                &self,
+                self.manifest_bytes()?,
                 self.platform.clone(),
             )
             .await

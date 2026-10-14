@@ -15,7 +15,6 @@ use futures::stream::{Stream, TryStreamExt};
 use home::home_dir;
 use keyring::v1::Entry;
 use reqwest::Response;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, ensure};
@@ -269,22 +268,19 @@ impl Registry {
         Ok(bytes)
     }
 
-    /// Push a manifest to the oci registtry
-    pub(crate) async fn push_manifest<T>(
+    /// Push manifest bytes to the oci registry exactly as provided, so a
+    /// manifest pushed by digest keeps that digest.
+    pub(crate) async fn push_manifest(
         &self,
         media_type: &MediaType,
         repository: &str,
         reference: &str,
-        manifest: &T,
+        bytes: Bytes,
         platform: Option<Platform>,
-    ) -> Result<Layer>
-    where
-        T: Serialize,
-    {
+    ) -> Result<Layer> {
         let repository = self.repository_name(repository);
-        let bytes = serde_json::to_vec(manifest).context(error::SerializeSnafu)?;
         let size = bytes.len();
-        let hash = Sha256::digest(bytes.as_slice());
+        let hash = Sha256::digest(&bytes);
         let digest = format!("sha256:{}", base16::encode_lower(hash.as_slice()));
         let response = self
             .client
@@ -293,7 +289,7 @@ impl Registry {
                 repository,
                 reference.into(),
                 &media_type.to_string(),
-                Bytes::from_owner(bytes),
+                bytes,
             )
             .await?;
         trace!(target: "registry", "put_manifest: {:?}", response);

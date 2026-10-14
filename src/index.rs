@@ -70,7 +70,7 @@ impl Index {
 
     /// Index bytes: the original bytes when available, otherwise this index
     /// serialized.
-    pub(crate) fn manifest_bytes(&self) -> crate::Result<Bytes> {
+    pub fn manifest_bytes(&self) -> crate::Result<Bytes> {
         match &self.raw {
             Some(raw) => Ok(raw.clone()),
             None => Ok(serde_json::to_vec(self)
@@ -150,14 +150,15 @@ impl Index {
         }
     }
 
-    /// Push this image index to a registry
+    /// Push this image index to a registry. Indexes that were fetched or
+    /// read are pushed with their original bytes so their digest is kept.
     pub async fn push(&self, uri: &Uri) -> crate::Result<()> {
         uri.registry()
             .push_manifest(
                 &self.media_type,
                 uri.repository(),
                 uri.reference().to_string().as_str(),
-                self,
+                self.manifest_bytes()?,
                 None,
             )
             .await?;
