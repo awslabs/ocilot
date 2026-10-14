@@ -429,6 +429,14 @@ enum WriterState {
         fut: BoxFuture<'static, crate::Result<Response>>,
         pending_advance: usize,
     },
+    /// Single-shot POST with the full blob is in flight. Registries that do
+    /// not support it answer `202 Accepted` with an upload session, which is
+    /// completed by PUTting `data` to the returned location.
+    Posting {
+        fut: BoxFuture<'static, crate::Result<Response>>,
+        data: Bytes,
+        digest: String,
+    },
     /// Drained successfully and the blob is durable.
     Done,
     /// Sticky failure state; further polls return the saved error string.
@@ -524,6 +532,59 @@ impl Writer {
                 // Only credit the durable bytes once the registry confirms
                 // the final PUT succeeded.
                 let advance = *pending_advance;
+                self.written += advance;
+                self.progress.inc(advance as u64);
+                self.state = WriterState::Done;
+                self.progress.finish();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                let err = self.fail(e);
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+
+    fn poll_posting(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let WriterState::Posting { fut, data, digest } = &mut self.state else {
+            unreachable!("poll_posting called outside Posting state");
+        };
+        match fut.poll_unpin(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(response)) => {
+                let status = response.status();
+                if status == reqwest::StatusCode::ACCEPTED {
+                    // The registry opened an upload session instead of
+                    // storing the blob; finish it with a single PUT.
+                    let data = data.clone();
+                    let digest = digest.clone();
+                    let upload_url =
+                        match crate::client::extract_location(&response, &self.current_url()) {
+                            Ok(u) => u,
+                            Err(e) => {
+                                let err = self.fail(e);
+                                return Poll::Ready(Err(err));
+                            }
+                        };
+                    let chunk_len = data.len();
+                    let client = self.uri.registry().client.clone();
+                    let fut = async move {
+                        client
+                            .finish_blob_upload(upload_url, data, digest, 0, chunk_len)
+                            .await
+                    }
+                    .boxed();
+                    self.state = WriterState::Finishing {
+                        fut,
+                        pending_advance: chunk_len,
+                    };
+                    return Poll::Ready(Ok(()));
+                }
+                if !status.is_success() {
+                    let err = self.fail(format!("registry rejected blob upload: {status}"));
+                    return Poll::Ready(Err(err));
+                }
+                let advance = data.len();
                 self.written += advance;
                 self.progress.inc(advance as u64);
                 self.state = WriterState::Done;
@@ -639,7 +700,6 @@ impl Writer {
     /// the buffer holds the entire blob and we are in Initial state.
     fn launch_monolithic_post(&mut self) {
         let chunk = std::mem::take(&mut self.buffer);
-        let chunk_len = chunk.len();
         self.digest.update(&chunk);
         let digest = self.digest.finalize_digest_string();
         let bytes = Bytes::from(chunk);
@@ -652,16 +712,19 @@ impl Writer {
         };
         let repository = self.uri.repository().clone();
         let client = self.uri.registry().client.clone();
+        let post_data = bytes.clone();
+        let post_digest = digest.clone();
         let fut = async move {
             client
-                .post_blob(registry_url, repository, bytes, digest)
+                .post_blob(registry_url, repository, post_data, post_digest)
                 .await
         }
         .boxed();
-        // Defer offset/progress advance until poll_finishing confirms success.
-        self.state = WriterState::Finishing {
+        // Defer offset/progress advance until poll_posting confirms success.
+        self.state = WriterState::Posting {
             fut,
-            pending_advance: chunk_len,
+            data: bytes,
+            digest,
         };
     }
 
@@ -711,6 +774,11 @@ impl AsyncWrite for Writer {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 },
                 WriterState::Finishing { .. } => match this.poll_finishing(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Posting { .. } => match this.poll_posting(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(())) => continue,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -769,6 +837,11 @@ impl AsyncWrite for Writer {
                     Poll::Ready(Ok(())) => continue,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 },
+                WriterState::Posting { .. } => match this.poll_posting(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
                 WriterState::Initial | WriterState::Idle { .. } => return Poll::Ready(Ok(())),
             }
         }
@@ -796,6 +869,11 @@ impl AsyncWrite for Writer {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 },
                 WriterState::Finishing { .. } => match this.poll_finishing(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                },
+                WriterState::Posting { .. } => match this.poll_posting(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(())) => continue,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
