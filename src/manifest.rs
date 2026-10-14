@@ -7,10 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
+use tokio::io::AsyncWrite;
 
 use crate::image::Image;
 use crate::index::Index;
 use crate::models::MediaType;
+use crate::oci::OciOptions;
+use crate::progress::SharedProgress;
 use crate::uri::Uri;
 use crate::{Result, error};
 
@@ -34,10 +37,22 @@ impl Manifest {
     /// Falls back to [`error::BodyDeserializeSnafu`] when the response is
     /// missing `mediaType` or contains an unrecognized value.
     pub async fn fetch(uri: &Uri) -> Result<Self> {
-        let value = uri
+        let bytes = uri
             .registry()
-            .fetch_manifest_value(uri.repository(), uri.reference().to_string().as_str())
+            .fetch_manifest_bytes(uri.repository(), uri.reference().to_string().as_str())
             .await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).context(error::BodyDeserializeSnafu)?;
+        let mut manifest = Self::from_value(value)?;
+        match &mut manifest {
+            Manifest::Index(index) => index.set_raw(bytes),
+            Manifest::Image(image) => image.set_raw(bytes),
+        }
+        Ok(manifest)
+    }
+
+    /// Dispatch a parsed manifest document into the matching variant.
+    fn from_value(value: serde_json::Value) -> Result<Self> {
         let media_type: Option<MediaType> = value
             .get("mediaType")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -64,6 +79,24 @@ impl Manifest {
                     Ok(Manifest::Image(image))
                 }
             }
+        }
+    }
+
+    /// Write the manifest out as an OCI image layout tar archive. See
+    /// [`Index::to_oci`] and [`Image::to_oci`] for the resulting layout.
+    pub async fn to_oci<W>(
+        &self,
+        uri: &Uri,
+        output: W,
+        progress: SharedProgress,
+        options: &OciOptions,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        match self {
+            Manifest::Index(index) => index.to_oci(uri, output, progress, options).await,
+            Manifest::Image(image) => image.to_oci(uri, output, progress, options).await,
         }
     }
 

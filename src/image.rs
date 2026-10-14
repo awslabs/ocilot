@@ -4,9 +4,11 @@ use crate::digest::Digest;
 use crate::error;
 use crate::layer::Layer;
 use crate::models::{Config, ImageConfig, MediaType, Platform, TarballManifest};
+use crate::oci::{OciLayout, OciOptions, root_digest};
 use crate::progress::{ProgressReporter, SharedProgress};
 use crate::uri::{Reference, Uri};
 use bon::Builder;
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,10 @@ pub struct Image {
     #[builder(into)]
     #[serde(skip)]
     platform: Option<Platform>,
+    /// Exact manifest bytes as served by the registry or read from disk.
+    #[builder(skip)]
+    #[serde(skip)]
+    raw: Option<Bytes>,
 }
 
 impl Image {
@@ -50,10 +56,34 @@ impl Image {
             .read_to_end(&mut buffer)
             .await
             .context(error::ArchiveSnafu)?;
-        let mut me: Self =
-            serde_json::from_slice(buffer.as_slice()).context(error::ImageInvalidManifestSnafu)?;
+        let mut me = Self::from_bytes(Bytes::from(buffer))?;
         me.platform = platform;
         Ok(me)
+    }
+
+    /// Parse an image manifest, keeping the original bytes so the manifest
+    /// can be stored without altering its digest.
+    pub(crate) fn from_bytes(bytes: Bytes) -> crate::Result<Self> {
+        let mut me: Self =
+            serde_json::from_slice(&bytes).context(error::ImageInvalidManifestSnafu)?;
+        me.raw = Some(bytes);
+        Ok(me)
+    }
+
+    /// Manifest bytes: the original bytes when available, otherwise this
+    /// manifest serialized.
+    pub(crate) fn manifest_bytes(&self) -> crate::Result<Bytes> {
+        match &self.raw {
+            Some(raw) => Ok(raw.clone()),
+            None => Ok(serde_json::to_vec(self)
+                .context(error::SerializeSnafu)?
+                .into()),
+        }
+    }
+
+    /// Record the exact bytes this manifest was parsed from.
+    pub(crate) fn set_raw(&mut self, raw: Bytes) {
+        self.raw = Some(raw);
     }
 
     /// Create a new Image manifest with the provided config layer and layers
@@ -64,6 +94,7 @@ impl Image {
             config: config.clone(),
             layers: layers.to_vec(),
             platform,
+            raw: None,
         }
     }
 
@@ -73,10 +104,12 @@ impl Image {
             matches!(uri.reference(), Reference::Digest { .. }),
             error::DirectLoadImageSnafu { uri: uri.clone() }
         );
-        let mut me: Self = uri
+        let bytes = uri
             .registry()
-            .fetch_manifest(uri.repository(), uri.reference().to_string().as_str())
+            .fetch_manifest_bytes(uri.repository(), uri.reference().to_string().as_str())
             .await?;
+        let mut me: Self = serde_json::from_slice(&bytes).context(error::BodyDeserializeSnafu)?;
+        me.raw = Some(bytes);
         me.platform = platform.clone();
         Ok(me)
     }
@@ -189,6 +222,7 @@ impl Image {
             .await
             .context(error::FileSnafu)?;
         Layer::copy(&mut config_reader, &mut config_file, self.config.size()).await?;
+        config_reader.verify().await?;
 
         // Each spawned task gets its own clone of the Arc-backed
         // SharedProgress; no `unsafe` lifetime extension required.
@@ -211,6 +245,7 @@ impl Image {
                     .await
                     .context(error::FileSnafu)?;
                 Layer::copy(&mut reader, &mut blob_file, layer.size()).await?;
+                reader.verify().await?;
                 Ok(blob_layer)
             }));
         }
@@ -233,6 +268,34 @@ impl Image {
         archive.finish().await.context(error::ArchiveSnafu)?;
 
         Ok(())
+    }
+
+    /// Write this image out as an OCI image layout tar archive whose
+    /// `index.json` holds a single descriptor pointing at this manifest.
+    /// The platform in `options` is ignored as an image manifest is already
+    /// platform specific. Pass a populated [`SharedProgress`] for progress
+    /// reporting or [`SharedProgress::none`] for silent operation.
+    pub async fn to_oci<W>(
+        &self,
+        uri: &Uri,
+        output: W,
+        progress: SharedProgress,
+        options: &OciOptions,
+    ) -> crate::Result<()>
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let bytes = self.manifest_bytes()?;
+        let digest = root_digest(uri, &bytes)?;
+        let mut layout = OciLayout::new().await?;
+        layout.write_image(uri, self, &digest, &progress).await?;
+        let root = Layer::builder()
+            .media_type(self.media_type.clone())
+            .size(bytes.len())
+            .digest(digest)
+            .maybe_platform(self.platform.clone())
+            .build();
+        layout.finish(uri, root, options, output).await
     }
 
     /// Push this image to an oci registry

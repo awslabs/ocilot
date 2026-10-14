@@ -19,6 +19,8 @@ pub mod layer;
 pub mod manifest;
 /// OCI specification model types.
 pub mod models;
+/// OCI image layout archive export.
+pub mod oci;
 /// Optional progress reporting trait.
 pub mod progress;
 /// Registry client and operations.

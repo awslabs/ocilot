@@ -239,25 +239,14 @@ impl Registry {
         Ok(response.status().is_success())
     }
 
-    /// Fetch a manifest from the registry, this could be an Image Index or an Image manifest
-    pub(crate) async fn fetch_manifest<T>(&self, repository: &str, reference: &str) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        let value = self.fetch_manifest_value(repository, reference).await?;
-        serde_json::from_value(value).context(error::BodyDeserializeSnafu)
-    }
-
-    /// Fetch a manifest from the registry as a raw [`serde_json::Value`].
-    ///
-    /// This is useful for callers that need to inspect the `mediaType` field
-    /// before deciding how to deserialize the manifest (e.g. an [`Index`]
-    /// vs. an [`Image`]).
-    pub(crate) async fn fetch_manifest_value(
+    /// Fetch a manifest from the registry as the exact bytes served, which
+    /// is required whenever the content must still match its digest. Callers
+    /// inspect the `mediaType` field before deciding how to deserialize.
+    pub(crate) async fn fetch_manifest_bytes(
         &self,
         repository: &str,
         reference: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<Bytes> {
         let repository = self.repository_name(repository);
         let response = self
             .client
@@ -270,16 +259,14 @@ impl Registry {
                 reason: error_response(response).await
             }
         );
-        let value: serde_json::Value = response
-            .json()
+        let bytes = response
+            .bytes()
             .await
             .context(error::ResponseDeserializeSnafu)?;
-        if tracing::enabled!(tracing::Level::TRACE)
-            && let Ok(pretty) = serde_json::to_string_pretty(&value)
-        {
-            trace!(target: "registry", "RESPONSE BODY: {}", pretty);
+        if tracing::enabled!(tracing::Level::TRACE) {
+            trace!(target: "registry", "RESPONSE BODY: {}", String::from_utf8_lossy(&bytes));
         }
-        Ok(value)
+        Ok(bytes)
     }
 
     /// Push a manifest to the oci registtry
