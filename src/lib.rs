@@ -27,6 +27,8 @@ pub mod progress;
 pub mod registry;
 /// Repository operations.
 pub mod repository;
+/// Async tar framing used to read and write archives.
+pub(crate) mod tar_io;
 /// URI parsing and representation.
 pub mod uri;
 
