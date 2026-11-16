@@ -9,16 +9,16 @@ use crate::progress::{ProgressReporter, SharedProgress};
 use crate::uri::{Reference, Uri};
 use bon::Builder;
 use bytes::Bytes;
-use futures::StreamExt;
 use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, ensure};
 use std::collections::HashSet;
+use tar::{Archive, Builder as ArchiveBuilder};
 use tempfile::tempdir;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
-use tokio_tar::{Archive, Builder as ArchiveBuilder};
+use tokio_util::io::SyncIoBridge;
 
 const WHITEOUT: &str = ".wh.";
 
@@ -165,15 +165,15 @@ impl Image {
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mut archive = ArchiveBuilder::new(output);
+        let mut archive = ArchiveBuilder::new(SyncIoBridge::new(output));
         let mut filemap: HashSet<String> = HashSet::new();
 
         for layer in self.layers.iter().rev() {
             let reader = Decompress::new(layer.media_type(), layer.open(uri, progress).await?)?;
-            let mut layer = Archive::new(reader);
+            let mut layer = Archive::new(SyncIoBridge::new(reader));
             // Use the raw entry stream to avoid truncation of long links and long paths.
-            let mut entries = layer.entries_raw().context(error::LayerArchiveSnafu)?;
-            while let Some(entry) = entries.next().await {
+            let mut entries = layer.entries().context(error::LayerArchiveSnafu)?;
+            while let Some(entry) = entries.next() {
                 let mut entry = entry.context(error::LayerArchiveSnafu)?;
                 let header = entry.header().clone();
                 let path = header.path().context(error::LayerArchiveSnafu)?;
@@ -186,11 +186,10 @@ impl Image {
                 filemap.insert(path.to_string());
                 archive
                     .append(&header, &mut entry)
-                    .await
                     .context(error::LayerCopySnafu)?;
             }
         }
-        archive.finish().await.context(error::ArchiveSnafu)?;
+        archive.finish().context(error::ArchiveSnafu)?;
         Ok(())
     }
 
@@ -260,12 +259,11 @@ impl Image {
         tokio::fs::write(tmp_dir.path().join("manifest.json"), manifest_bytes)
             .await
             .context(error::FileSnafu)?;
-        let mut archive = ArchiveBuilder::new(output);
+        let mut archive = ArchiveBuilder::new(SyncIoBridge::new(output));
         archive
             .append_dir_all(".", tmp_dir.path().to_path_buf())
-            .await
             .context(error::ArchiveSnafu)?;
-        archive.finish().await.context(error::ArchiveSnafu)?;
+        archive.finish().context(error::ArchiveSnafu)?;
 
         Ok(())
     }

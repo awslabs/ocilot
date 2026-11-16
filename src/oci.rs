@@ -10,11 +10,12 @@ use async_recursion::async_recursion;
 use bon::Builder;
 use futures::future::try_join_all;
 use snafu::{ResultExt, ensure};
+use tar::Builder as ArchiveBuilder;
 use tempfile::{TempDir, tempdir};
 use tokio::fs::{File, create_dir_all};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
-use tokio_tar::Builder as ArchiveBuilder;
+use tokio_util::io::SyncIoBridge;
 
 use crate::digest::Digest;
 use crate::error;
@@ -239,12 +240,11 @@ impl OciLayout {
             .await
             .context(error::FileSnafu)?;
 
-        let mut archive = ArchiveBuilder::new(output);
+        let mut archive = ArchiveBuilder::new(SyncIoBridge::new(output));
         archive
             .append_dir_all(".", self.dir.path().to_path_buf())
-            .await
             .context(error::ArchiveSnafu)?;
-        archive.finish().await.context(error::ArchiveSnafu)?;
+        archive.finish().context(error::ArchiveSnafu)?;
         Ok(())
     }
 }

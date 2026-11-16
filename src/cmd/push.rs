@@ -3,7 +3,6 @@ use std::str::FromStr;
 
 use async_recursion::async_recursion;
 use clap::Parser;
-use futures::StreamExt;
 use futures::future::try_join_all;
 use ocilot::digest::Digest;
 use ocilot::error;
@@ -14,11 +13,12 @@ use ocilot::manifest::Manifest;
 use ocilot::progress::SharedProgress;
 use ocilot::uri::{Reference, Uri};
 use snafu::{OptionExt, ResultExt};
+use std::collections::HashMap;
 use std::io::SeekFrom;
-use tokio::io::AsyncSeekExt;
+use tar::Archive;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::task::JoinHandle;
-use tokio::{fs::File, io::AsyncReadExt};
-use tokio_tar::{Archive, Entry};
 
 use super::context::Ctx;
 
@@ -37,16 +37,12 @@ impl Push {
         let mut uri = Uri::new(self.uri.as_str()).await?;
         uri.set_secure(!self.insecure);
         let progress = ctx.progress();
-        let mut archive = File::open(&self.archive).await.context(error::FileSnafu)?;
-        // We need to find the index first
-        let mut index_entry = afind(&mut archive, |x| x.ends_with("index.json"))
-            .await?
+        // One header-only pass over the tar; every later read seeks directly
+        // to the blob, so nothing holds a sync tar `Entry` across an await.
+        let blobs = scan_archive(&self.archive)?;
+        let loc = locate(&blobs, |x| x.ends_with("index.json"))
             .context(error::ImageNotValidSnafu {})?;
-        let mut buffer = Vec::new();
-        index_entry
-            .read_to_end(&mut buffer)
-            .await
-            .context(error::ArchiveSnafu)?;
+        let buffer = read_blob(&self.archive, loc).await?;
         let Manifest::Index(index) = Manifest::from_slice(buffer.as_slice())? else {
             return error::ImageNotValidSnafu {}.fail();
         };
@@ -56,13 +52,13 @@ impl Push {
         // single image). Otherwise index.json is the index being pushed.
         let root = match index.manifests() {
             [single] if !addresses(&uri, &buffer)? => {
-                read_manifest(&mut archive, single.digest()).await?
+                self.read_manifest(&blobs, single.digest()).await?
             }
             _ => Manifest::Index(index),
         };
         match root {
-            Manifest::Index(index) => self.push_index(&uri, &index, &progress).await,
-            Manifest::Image(image) => self.push_image(&uri, &image, &progress).await,
+            Manifest::Index(index) => self.push_index(&uri, &index, &blobs, &progress).await,
+            Manifest::Image(image) => self.push_image(&uri, &image, &blobs, &progress).await,
         }
     }
 
@@ -73,18 +69,22 @@ impl Push {
         &self,
         uri: &Uri,
         index: &Index,
+        blobs: &HashMap<PathBuf, BlobLocation>,
         progress: &SharedProgress,
     ) -> Result<(), error::Error> {
-        let mut archive = File::open(&self.archive).await.context(error::FileSnafu)?;
         for child in index.manifests().iter() {
             let child_uri = Uri::builder()
                 .registry(uri.registry().clone())
                 .repository(uri.repository())
                 .reference(Reference::from_str(child.digest())?)
                 .build();
-            match read_manifest(&mut archive, child.digest()).await? {
-                Manifest::Index(nested) => self.push_index(&child_uri, &nested, progress).await?,
-                Manifest::Image(image) => self.push_image(&child_uri, &image, progress).await?,
+            match self.read_manifest(blobs, child.digest()).await? {
+                Manifest::Index(nested) => {
+                    self.push_index(&child_uri, &nested, blobs, progress).await?
+                }
+                Manifest::Image(image) => {
+                    self.push_image(&child_uri, &image, blobs, progress).await?
+                }
             }
         }
         index.push(uri).await
@@ -95,65 +95,35 @@ impl Push {
         &self,
         uri: &Uri,
         image: &Image,
+        blobs: &HashMap<PathBuf, BlobLocation>,
         progress: &SharedProgress,
     ) -> Result<(), error::Error> {
-        let mut archive = File::open(&self.archive).await.context(error::FileSnafu)?;
-        // First lets copy the config blob
-        let config_digest = Digest::parse(image.config().digest())?;
-        let mut config_entry = afind(&mut archive, |x| x.ends_with(config_digest.hex()))
-            .await?
-            .context(error::BlobMissingSnafu {
-                digest: image.config().digest(),
-            })?;
-        let config_size = config_entry
-            .header()
-            .raw_entry_size()
-            .context(error::ArchiveSnafu)?;
-
-        let mut writer = Layer::create(
-            uri,
-            image.config().media_type(),
-            config_size as usize,
-            Some(image.config().digest().to_string()),
-            progress.as_ref(),
+        let find = |layer: &Layer| -> Result<BlobLocation, error::Error> {
+            let digest = Digest::parse(layer.digest())?;
+            locate(blobs, |x| x.ends_with(digest.hex())).context(error::BlobMissingSnafu {
+                digest: layer.digest(),
+            })
+        };
+        // Config first, then all layers concurrently.
+        copy_layer(
+            uri.clone(),
+            image.config().clone(),
+            self.archive.clone(),
+            find(image.config())?,
+            progress.clone(),
         )
         .await?;
-        if let Some(writer) = writer.as_mut() {
-            Layer::copy(&mut config_entry, writer, config_size as usize).await?;
-            writer.layer().await?;
-        }
+
         let mut tasks: Vec<JoinHandle<Result<(), error::Error>>> = Vec::new();
-        // Copy all the blobs
         for layer in image.layers().iter() {
-            let mut larchive = File::open(&self.archive).await.context(error::FileSnafu)?;
-            let layer = layer.clone();
-            let uri = uri.clone();
-            let progress = progress.clone();
-            tasks.push(tokio::spawn(async move {
-                let layer_digest = Digest::parse(layer.digest())?;
-                let mut layer_entry = afind(&mut larchive, |x| x.ends_with(layer_digest.hex()))
-                    .await?
-                    .context(error::BlobMissingSnafu {
-                        digest: layer.digest(),
-                    })?;
-                let layer_size = layer_entry
-                    .header()
-                    .raw_entry_size()
-                    .context(error::ArchiveSnafu)?;
-                let mut writer = Layer::create(
-                    &uri,
-                    layer.media_type(),
-                    layer_size as usize,
-                    Some(layer.digest().to_string()),
-                    progress.as_ref(),
-                )
-                .await?;
-                if let Some(writer) = writer.as_mut() {
-                    Layer::copy(&mut layer_entry, writer, layer_size as usize).await?;
-                    writer.layer().await?;
-                }
-                Ok(())
-            }));
+            let loc = find(layer)?;
+            tasks.push(tokio::spawn(copy_layer(
+                uri.clone(),
+                layer.clone(),
+                self.archive.clone(),
+                loc,
+                progress.clone(),
+            )));
         }
         try_join_all(tasks)
             .await
@@ -162,6 +132,18 @@ impl Push {
             .collect::<Result<Vec<_>, error::Error>>()?;
         image.push(uri).await?;
         Ok(())
+    }
+
+    /// Read the manifest blob for `digest` from the archive.
+    async fn read_manifest(
+        &self,
+        blobs: &HashMap<PathBuf, BlobLocation>,
+        digest: &str,
+    ) -> Result<Manifest, error::Error> {
+        let parsed = Digest::parse(digest)?;
+        let loc = locate(blobs, |x| x.ends_with(parsed.hex()))
+            .context(error::BlobMissingSnafu { digest })?;
+        Manifest::from_slice(read_blob(&self.archive, loc).await?.as_slice())
     }
 }
 
@@ -176,39 +158,92 @@ fn addresses(uri: &Uri, bytes: &[u8]) -> Result<bool, error::Error> {
     }
 }
 
-/// Read the manifest blob for `digest` from the archive.
-async fn read_manifest(archive: &mut File, digest: &str) -> Result<Manifest, error::Error> {
-    let parsed = Digest::parse(digest)?;
-    let mut entry = afind(archive, |x| x.ends_with(parsed.hex()))
-        .await?
-        .context(error::BlobMissingSnafu { digest })?;
-    let mut buffer = Vec::new();
-    entry
-        .read_to_end(&mut buffer)
-        .await
-        .context(error::ArchiveSnafu)?;
-    Manifest::from_slice(buffer.as_slice())
+/// Location of a regular file's contents inside an uncompressed tar.
+#[derive(Clone, Copy, Debug)]
+struct BlobLocation {
+    offset: u64,
+    size: u64,
 }
 
-async fn afind<F>(
-    archive: &mut File,
+/// Scan the archive headers once and record where each regular file's data
+/// lives. Uses `entries_with_seek` so blob data is skipped, not read.
+fn scan_archive(path: &Path) -> Result<HashMap<PathBuf, BlobLocation>, error::Error> {
+    let file = std::fs::File::open(path).context(error::ArchiveSnafu)?;
+    let mut archive = Archive::new(file);
+    let mut locations = HashMap::new();
+    for entry in archive.entries_with_seek().context(error::ArchiveSnafu)? {
+        let entry = entry.context(error::ArchiveSnafu)?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().context(error::ArchiveSnafu)?.into_owned();
+        locations.insert(
+            path,
+            BlobLocation {
+                offset: entry.raw_file_position(),
+                size: entry.size(),
+            },
+        );
+    }
+    Ok(locations)
+}
+
+fn locate<F>(
+    locations: &HashMap<PathBuf, BlobLocation>,
     predicate: F,
-) -> Result<Option<Entry<Archive<&mut File>>>, error::Error>
+) -> Option<BlobLocation>
 where
     F: Fn(&Path) -> bool,
 {
-    archive
-        .seek(SeekFrom::Start(0))
+    locations
+        .iter()
+        .find(|(path, _)| predicate(path))
+        .map(|(_, loc)| *loc)
+}
+
+/// Open an async reader over exactly the bytes of `loc`.
+async fn open_blob(
+    archive: &Path,
+    loc: BlobLocation,
+) -> Result<tokio::io::Take<File>, error::Error> {
+    let mut file = File::open(archive).await.context(error::FileSnafu)?;
+    file.seek(SeekFrom::Start(loc.offset))
         .await
         .context(error::FileSnafu)?;
-    let mut archive = Archive::new(archive);
-    let mut entries = archive.entries().context(error::ArchiveSnafu)?;
-    while let Some(entry) = entries.next().await {
-        let entry = entry.context(error::ArchiveSnafu)?;
-        let path = entry.path().context(error::ArchiveSnafu)?;
-        if predicate(path.as_ref()) {
-            return Ok(Some(entry));
-        }
+    Ok(file.take(loc.size))
+}
+
+async fn read_blob(archive: &Path, loc: BlobLocation) -> Result<Vec<u8>, error::Error> {
+    let mut buffer = Vec::with_capacity(loc.size as usize);
+    open_blob(archive, loc)
+        .await?
+        .read_to_end(&mut buffer)
+        .await
+        .context(error::ArchiveSnafu)?;
+    Ok(buffer)
+}
+
+/// Upload the blob described by `layer` from the archive to `uri`.
+async fn copy_layer(
+    uri: Uri,
+    layer: Layer,
+    archive: PathBuf,
+    loc: BlobLocation,
+    progress: SharedProgress,
+) -> Result<(), error::Error> {
+    let size = loc.size as usize;
+    let mut writer = Layer::create(
+        &uri,
+        layer.media_type(),
+        size,
+        Some(layer.digest().to_string()),
+        progress.as_ref(),
+    )
+    .await?;
+    if let Some(writer) = writer.as_mut() {
+        let mut reader = open_blob(&archive, loc).await?;
+        Layer::copy(&mut reader, writer, size).await?;
+        writer.layer().await?;
     }
-    Ok(None)
+    Ok(())
 }

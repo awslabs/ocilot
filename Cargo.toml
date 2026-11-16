@@ -6,7 +6,6 @@ description = "cli and library for interacting with OCI registries"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-astral-tokio-tar = "0.7"
 async-compression = {
   version = "0.4",
   features = [
@@ -60,6 +59,7 @@ home = "0.5"
 indicatif = { version = "0.18", optional = true }
 jiff = { version = "0.2", features = ["serde"] }
 keyring = "4.2"
+parking_lot = "0.13"
 reqwest = {
   version = "0.13",
   features = [
@@ -71,9 +71,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 snafu = "0.9"
+tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io-util"] }
 tracing = "0.1"
 tracing-indicatif = { version = "0.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
