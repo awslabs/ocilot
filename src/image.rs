@@ -6,10 +6,11 @@ use crate::layer::Layer;
 use crate::models::{Config, ImageConfig, MediaType, Platform, TarballManifest};
 use crate::oci::{OciLayout, OciOptions, root_digest};
 use crate::progress::{ProgressReporter, SharedProgress};
+#[cfg(feature = "compression")]
+use crate::tar_io;
 use crate::uri::{Reference, Uri};
 use bon::Builder;
 use bytes::Bytes;
-use futures::StreamExt;
 use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, ensure};
@@ -18,7 +19,6 @@ use tempfile::tempdir;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
-use tokio_tar::{Archive, Builder as ArchiveBuilder};
 
 const WHITEOUT: &str = ".wh.";
 
@@ -165,32 +165,29 @@ impl Image {
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mut archive = ArchiveBuilder::new(output);
+        let mut output = output;
         let mut filemap: HashSet<String> = HashSet::new();
 
         for layer in self.layers.iter().rev() {
-            let reader = Decompress::new(layer.media_type(), layer.open(uri, progress).await?)?;
-            let mut layer = Archive::new(reader);
-            // Use the raw entry stream to avoid truncation of long links and long paths.
-            let mut entries = layer.entries_raw().context(error::LayerArchiveSnafu)?;
-            while let Some(entry) = entries.next().await {
-                let mut entry = entry.context(error::LayerArchiveSnafu)?;
-                let header = entry.header().clone();
-                let path = header.path().context(error::LayerArchiveSnafu)?;
-                let path = path.to_string_lossy();
+            let mut reader = Decompress::new(layer.media_type(), layer.open(uri, progress).await?)?;
+            // Members are copied verbatim, extension records included, so
+            // long paths and link targets survive.
+            tar_io::copy_members(&mut reader, &mut output, |member| {
+                let path = member.path.to_string_lossy();
                 if path.contains(WHITEOUT)
-                    || (header.entry_type().is_file() && filemap.contains(path.as_ref()))
+                    || (member.header.entry_type().is_file() && filemap.contains(path.as_ref()))
                 {
-                    continue;
+                    return false;
                 }
-                filemap.insert(path.to_string());
-                archive
-                    .append(&header, &mut entry)
-                    .await
-                    .context(error::LayerCopySnafu)?;
-            }
+                filemap.insert(path.into_owned());
+                true
+            })
+            .await
+            .context(error::LayerArchiveSnafu)?;
         }
-        archive.finish().await.context(error::ArchiveSnafu)?;
+        tar_io::finish(&mut output)
+            .await
+            .context(error::ArchiveSnafu)?;
         Ok(())
     }
 
@@ -260,12 +257,13 @@ impl Image {
         tokio::fs::write(tmp_dir.path().join("manifest.json"), manifest_bytes)
             .await
             .context(error::FileSnafu)?;
-        let mut archive = ArchiveBuilder::new(output);
-        archive
-            .append_dir_all(".", tmp_dir.path().to_path_buf())
+        let mut output = output;
+        tar_io::append_dir_all(&mut output, tmp_dir.path())
             .await
             .context(error::ArchiveSnafu)?;
-        archive.finish().await.context(error::ArchiveSnafu)?;
+        tar_io::finish(&mut output)
+            .await
+            .context(error::ArchiveSnafu)?;
 
         Ok(())
     }

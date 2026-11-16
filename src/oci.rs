@@ -14,7 +14,6 @@ use tempfile::{TempDir, tempdir};
 use tokio::fs::{File, create_dir_all};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
-use tokio_tar::Builder as ArchiveBuilder;
 
 use crate::digest::Digest;
 use crate::error;
@@ -24,6 +23,7 @@ use crate::layer::{Layer, digest_bytes};
 use crate::manifest::Manifest;
 use crate::models::Platform;
 use crate::progress::SharedProgress;
+use crate::tar_io;
 use crate::uri::{Reference, Uri};
 
 /// Annotation key naming a reference in an image layout's `index.json`.
@@ -239,13 +239,13 @@ impl OciLayout {
             .await
             .context(error::FileSnafu)?;
 
-        let mut archive = ArchiveBuilder::new(output);
-        archive
-            .append_dir_all(".", self.dir.path().to_path_buf())
+        let mut output = output;
+        tar_io::append_dir_all(&mut output, self.dir.path())
             .await
             .context(error::ArchiveSnafu)?;
-        archive.finish().await.context(error::ArchiveSnafu)?;
-        Ok(())
+        tar_io::finish(&mut output)
+            .await
+            .context(error::ArchiveSnafu)
     }
 }
 
@@ -327,5 +327,25 @@ mod tests {
                 .join(Digest::parse(&digest).unwrap().hex())
                 .exists()
         );
+    }
+
+    // `pull` runs on a multi-thread runtime; archiving must not block it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finish_archives_layout() {
+        let layout = OciLayout::new().await.unwrap();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let file = File::from_std(out.reopen().unwrap());
+        layout
+            .finish(&uri().await, descriptor(), &OciOptions::default(), file)
+            .await
+            .unwrap();
+        let mut archive = tar::Archive::new(std::fs::File::open(out.path()).unwrap());
+        let mut names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["index.json", "oci-layout"]);
     }
 }
