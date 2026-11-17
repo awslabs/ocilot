@@ -20,6 +20,11 @@ ignore = [
   # { id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
   # "a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
   # { crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
+  # Unmaintained, merged into zbus 6. Pulled in by keyring's Linux
+  # secret-service backend, which is still on zbus 5 as of keyring 4.2.0.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant via keyring; no keyring release on zbus 6 yet" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names via keyring; no keyring release on zbus 6 yet" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via keyring; no keyring release on zbus 6 yet" },
 ]
 # git-fetch-with-cli = true
 
@@ -85,7 +90,6 @@ deny = [
 
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = [
-  { crate = "base64", reason = "aws-sdk crates still on old version" },
   { crate = "core-foundation", reason = "Multiple copies brought in by keyring + aws-*" },
   { crate = "syn", reason = "Multiple copies brought in as ecosystem moves from 2 -> 3" },
 ]
