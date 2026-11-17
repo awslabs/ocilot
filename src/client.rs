@@ -1,14 +1,16 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::models::Token;
 use crate::{Result, error};
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::LOCATION;
-use reqwest::{RequestBuilder, Response};
+use reqwest::header::{LOCATION, WWW_AUTHENTICATE};
+use reqwest::{RequestBuilder, Response, StatusCode};
+use serde::Deserialize;
 use snafu::{OptionExt, ResultExt};
-use url::Url;
+use url::{Origin, Url};
 
 /// Accept header sent on manifest requests so the registry returns the
 /// canonical manifest representation rather than an arbitrary default.
@@ -85,25 +87,200 @@ pub(crate) trait RegistryClientImpl: Send + Sync + Debug {
 pub struct SimpleRegistryClient {
     client: reqwest::Client,
     auth: Option<Token>,
+    /// Tokens from answering bearer challenges, keyed by the origin that
+    /// issued the challenge so they are never sent anywhere else. `Token`'s
+    /// `Debug` keeps them redacted.
+    challenge_tokens: Mutex<HashMap<Origin, Token>>,
 }
+
+/// Cap on a token endpoint's response; real ones are a few KiB.
+const MAX_TOKEN_RESPONSE: usize = 1 << 20;
 
 impl SimpleRegistryClient {
     pub fn new(auth: Option<Token>) -> Self {
         Self {
             client: reqwest::Client::new(),
             auth,
+            challenge_tokens: Mutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn auth(&self, request: RequestBuilder) -> RequestBuilder {
-        if let Some(token) = self.auth.as_ref() {
-            match token {
-                Token::Bearer(t) => request.bearer_auth(t),
-                Token::Basic { username, password } => request.basic_auth(username, Some(password)),
+    fn tokens(&self) -> MutexGuard<'_, HashMap<Origin, Token>> {
+        self.challenge_tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Attach a token `origin` issued, else the configured credentials.
+    fn auth(&self, request: RequestBuilder, origin: &Origin) -> RequestBuilder {
+        let issued = self.tokens().get(origin).cloned();
+        match issued.as_ref().or(self.auth.as_ref()) {
+            Some(Token::Bearer(t)) => request.bearer_auth(t),
+            Some(Token::Basic { username, password }) => {
+                request.basic_auth(username, Some(password))
             }
-        } else {
-            request
+            None => request,
         }
+    }
+
+    /// Send `request` with credentials. Registries such as Docker Hub and GHCR
+    /// answer with a 401 bearer challenge; it is answered once and the request
+    /// retried with the issued token, which later requests to that origin reuse.
+    async fn send(&self, request: RequestBuilder) -> Result<Response> {
+        let (client, request) = request.build_split();
+        let request = request.context(error::RequestSnafu)?;
+        let url = request.url().clone();
+        let origin = url.origin();
+        let retry = request.try_clone();
+        let response = self
+            .auth(RequestBuilder::from_parts(client.clone(), request), &origin)
+            .send()
+            .await
+            .context(error::RequestSnafu)?;
+        // Only the addressed origin may challenge: a host reached by redirect
+        // (a blob CDN, say) must never be handed the registry's credentials.
+        // A configured bearer token has no exchange, so its 401 stands.
+        if response.status() != StatusCode::UNAUTHORIZED
+            || response.url().origin() != origin
+            || matches!(self.auth, Some(Token::Bearer(_)))
+        {
+            return Ok(response);
+        }
+        let challenge = response
+            .headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(BearerChallenge::parse);
+        let (Some(retry), Some(challenge)) = (retry, challenge) else {
+            return Ok(response);
+        };
+        let token = self.fetch_token(&url, &challenge).await?;
+        let response = RequestBuilder::from_parts(client, retry)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context(error::RequestSnafu)?;
+        // Cache only an accepted token, so a useless one can't replace a good one.
+        if response.status() != StatusCode::UNAUTHORIZED {
+            self.tokens().insert(origin, Token::Bearer(token));
+        }
+        Ok(response)
+    }
+
+    /// Get a token from the challenge's realm, presenting basic credentials
+    /// when configured (anonymous otherwise).
+    async fn fetch_token(&self, registry: &Url, challenge: &BearerChallenge) -> Result<String> {
+        let fail = |reason: String| error::Error::AuthToken {
+            realm: challenge.realm.clone(),
+            reason,
+        };
+        let mut realm = Url::parse(&challenge.realm).map_err(|e| fail(e.to_string()))?;
+        if !realm_allowed(&realm, registry) {
+            return Err(fail("realm must use https".to_string()));
+        }
+        if challenge.service.is_some() || challenge.scope.is_some() {
+            let mut query = realm.query_pairs_mut();
+            if let Some(service) = &challenge.service {
+                query.append_pair("service", service);
+            }
+            for scope in challenge.scope.iter().flat_map(|s| s.split_whitespace()) {
+                query.append_pair("scope", scope);
+            }
+        }
+        let mut request = self.client.get(realm);
+        if let Some(Token::Basic { username, password }) = &self.auth {
+            request = request.basic_auth(username, Some(password));
+        }
+        let mut response = request.send().await.context(error::RequestSnafu)?;
+        if !response.status().is_success() {
+            return Err(fail(format!("HTTP {}", response.status())));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.context(error::RequestSnafu)? {
+            if body.len() + chunk.len() > MAX_TOKEN_RESPONSE {
+                return Err(fail("response too large".to_string()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body: TokenResponse = serde_json::from_slice(&body).map_err(|e| fail(e.to_string()))?;
+        body.token
+            .or(body.access_token)
+            .ok_or_else(|| fail("response has no token".to_string()))
+    }
+}
+
+/// Credentials are sent to the realm, which the registry chooses; refuse plain
+/// http unless the registry itself is addressed over http.
+fn realm_allowed(realm: &Url, registry: &Url) -> bool {
+    realm.scheme() == "https" || registry.scheme() == "http"
+}
+
+/// Token endpoint response; registries use either field name.
+#[derive(Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
+}
+
+/// A `WWW-Authenticate: Bearer ...` challenge.
+#[derive(Debug, PartialEq, Eq)]
+struct BearerChallenge {
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+impl BearerChallenge {
+    /// Parse `Bearer realm="...",service="...",scope="..."`. Quoted values may
+    /// contain commas (`scope="repository:a:pull,push"`) and escaped quotes.
+    fn parse(header: &str) -> Option<Self> {
+        let (scheme, mut rest) = header.trim().split_once(char::is_whitespace)?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        let (mut realm, mut service, mut scope) = (None, None, None);
+        loop {
+            rest = rest.trim_start_matches([' ', '\t', ',']);
+            if rest.is_empty() {
+                break;
+            }
+            let (key, after) = rest.split_once('=')?;
+            let after = after.trim_start();
+            let (value, remaining) = match after.strip_prefix('"') {
+                Some(quoted) => {
+                    let mut value = String::new();
+                    let mut chars = quoted.char_indices();
+                    let end = loop {
+                        match chars.next()? {
+                            (_, '\\') => value.push(chars.next()?.1),
+                            (i, '"') => break i + 1,
+                            (_, c) => value.push(c),
+                        }
+                    };
+                    // Skip anything between the closing quote and the next comma.
+                    let after_quote = &quoted[end..];
+                    let next = after_quote.find(',').unwrap_or(after_quote.len());
+                    (value, &after_quote[next..])
+                }
+                None => {
+                    let end = after.find(',').unwrap_or(after.len());
+                    (after[..end].trim().to_string(), &after[end..])
+                }
+            };
+            match key.trim().to_ascii_lowercase().as_str() {
+                "realm" => realm = Some(value),
+                "service" => service = Some(value),
+                "scope" => scope = Some(value),
+                _ => {}
+            }
+            rest = remaining;
+        }
+        Some(Self {
+            realm: realm?,
+            service,
+            scope,
+        })
     }
 }
 
@@ -137,35 +314,35 @@ impl RegistryClientImpl for SimpleRegistryClient {
         let request = self
             .client
             .get(uri.join("/v2/_catalog").context(error::UrlSnafu)?);
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.send(request).await
     }
 
     async fn head_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response> {
         let request = self
             .client
             .head(v2_url(uri, repository.split('/').chain(["blobs", digest]))?);
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.send(request).await
     }
 
     async fn get_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response> {
         let request = self
             .client
             .get(v2_url(uri, repository.split('/').chain(["blobs", digest]))?);
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.send(request).await
     }
 
     async fn del_blob(&self, uri: &Url, repository: &str, digest: &str) -> Result<Response> {
         let request = self
             .client
             .delete(v2_url(uri, repository.split('/').chain(["blobs", digest]))?);
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.send(request).await
     }
 
     async fn get_tags(&self, uri: &Url, repository: &str) -> Result<Response> {
         let request = self
             .client
             .get(v2_url(uri, repository.split('/').chain(["tags", "list"]))?);
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.send(request).await
     }
 
     async fn post_blob(
@@ -178,13 +355,13 @@ impl RegistryClientImpl for SimpleRegistryClient {
         let mut uri = v2_url(uri, repository.split('/').chain(["blobs", "uploads", ""]))?;
         uri.query_pairs_mut().append_pair("digest", digest);
         let request = self.client.post(uri);
-        self.auth(request)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", data.len())
-            .body(data)
-            .send()
-            .await
-            .context(error::RequestSnafu)
+        self.send(
+            request
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", data.len())
+                .body(data),
+        )
+        .await
     }
 
     async fn start_upload(&self, uri: &Url, repository: &str) -> Result<Response> {
@@ -192,11 +369,7 @@ impl RegistryClientImpl for SimpleRegistryClient {
             uri,
             repository.split('/').chain(["blobs", "uploads", ""]),
         )?);
-        self.auth(request)
-            .header("Content-Length", 0)
-            .send()
-            .await
-            .context(error::RequestSnafu)
+        self.send(request.header("Content-Length", 0)).await
     }
 
     async fn upload_part(
@@ -210,14 +383,14 @@ impl RegistryClientImpl for SimpleRegistryClient {
         // exclusive end (`start + len`) so subtract 1 for the wire format.
         let last = end.saturating_sub(1);
         let request = self.client.patch(upload_url.clone());
-        self.auth(request)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", data.len())
-            .header("Content-Range", format!("{}-{}", start, last))
-            .body(data)
-            .send()
-            .await
-            .context(error::RequestSnafu)
+        self.send(
+            request
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", data.len())
+                .header("Content-Range", format!("{}-{}", start, last))
+                .body(data),
+        )
+        .await
     }
 
     async fn finish_blob_upload(
@@ -238,17 +411,17 @@ impl RegistryClientImpl for SimpleRegistryClient {
         uri.set_query(Some(&new_query));
         let request = self.client.put(uri);
         let request = if data.is_empty() {
-            self.auth(request).header("Content-Length", 0)
+            request.header("Content-Length", 0)
         } else {
             // Inclusive end byte per RFC 7233 / OCI distribution spec.
             let last = end.saturating_sub(1);
-            self.auth(request)
+            request
                 .header("Content-Type", "application/octet-stream")
                 .header("Content-Length", data.len())
                 .header("Content-Range", format!("{}-{}", start, last))
                 .body(data)
         };
-        request.send().await.context(error::RequestSnafu)
+        self.send(request).await
     }
 
     async fn head_manifest(
@@ -261,11 +434,7 @@ impl RegistryClientImpl for SimpleRegistryClient {
             uri,
             repository.split('/').chain(["manifests", reference]),
         )?);
-        self.auth(request)
-            .header("Accept", MANIFEST_ACCEPT)
-            .send()
-            .await
-            .context(error::RequestSnafu)
+        self.send(request.header("Accept", MANIFEST_ACCEPT)).await
     }
 
     async fn get_manifest(&self, uri: &Url, repository: &str, reference: &str) -> Result<Response> {
@@ -273,11 +442,7 @@ impl RegistryClientImpl for SimpleRegistryClient {
             uri,
             repository.split('/').chain(["manifests", reference]),
         )?);
-        self.auth(request)
-            .header("Accept", MANIFEST_ACCEPT)
-            .send()
-            .await
-            .context(error::RequestSnafu)
+        self.send(request.header("Accept", MANIFEST_ACCEPT)).await
     }
 
     async fn put_manifest(
@@ -292,13 +457,13 @@ impl RegistryClientImpl for SimpleRegistryClient {
             uri,
             repository.split('/').chain(["manifests", reference]),
         )?);
-        self.auth(request)
-            .header("Content-Type", content_type)
-            .header("Content-Length", body.len())
-            .body(body)
-            .send()
-            .await
-            .context(error::RequestSnafu)
+        self.send(
+            request
+                .header("Content-Type", content_type)
+                .header("Content-Length", body.len())
+                .body(body),
+        )
+        .await
     }
 
     async fn del_manifest(&self, uri: &Url, repository: &str, reference: &str) -> Result<Response> {
@@ -306,7 +471,7 @@ impl RegistryClientImpl for SimpleRegistryClient {
             uri,
             repository.split('/').chain(["manifests", reference]),
         )?);
-        self.auth(request).send().await.context(error::RequestSnafu)
+        self.send(request).await
     }
 }
 
@@ -495,5 +660,285 @@ mod tests {
         assert!(url.path().starts_with("/v2/org/app/blobs/"));
         assert_eq!(url.path_segments().unwrap().count(), 5);
         assert!(!url.path().contains("/etc/passwd"));
+    }
+
+    #[test]
+    fn parses_bearer_challenges() {
+        let parsed = BearerChallenge::parse(concat!(
+            r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io","#,
+            r#"scope="repository:library/alpine:pull,push""#,
+        ));
+        assert_eq!(
+            parsed,
+            Some(BearerChallenge {
+                realm: "https://auth.docker.io/token".into(),
+                service: Some("registry.docker.io".into()),
+                scope: Some("repository:library/alpine:pull,push".into()),
+            })
+        );
+        // Case-insensitive scheme, spaced separators, bare and escaped values.
+        let parsed =
+            BearerChallenge::parse(r#"bearer realm=https://r.example/t , service="a \"b\"""#)
+                .unwrap();
+        assert_eq!(parsed.realm, "https://r.example/t");
+        assert_eq!(parsed.service.as_deref(), Some(r#"a "b""#));
+        assert_eq!(parsed.scope, None);
+        assert_eq!(BearerChallenge::parse(r#"Basic realm="registry""#), None);
+        assert_eq!(BearerChallenge::parse(r#"Bearer service="no-realm""#), None);
+        assert_eq!(
+            BearerChallenge::parse(r#"Bearer realm="unterminated"#),
+            None
+        );
+        // Junk after a quoted value doesn't swallow the next parameter.
+        let parsed = BearerChallenge::parse(r#"Bearer realm="a"x,service="s""#).unwrap();
+        assert_eq!(parsed.service.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn realm_must_be_https_for_https_registries() {
+        let https = Url::parse("https://registry.example").unwrap();
+        let http = Url::parse("http://localhost:5000").unwrap();
+        let tls_realm = Url::parse("https://auth.example/token").unwrap();
+        let plain_realm = Url::parse("http://auth.example/token").unwrap();
+        assert!(realm_allowed(&tls_realm, &https));
+        assert!(!realm_allowed(&plain_realm, &https));
+        assert!(realm_allowed(&plain_realm, &http));
+    }
+
+    mod challenge {
+        use super::*;
+        use wiremock::matchers::{body_string, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const MANIFEST: &str = "/v2/org/app/manifests/latest";
+
+        /// 401 for anything not carrying the issued token, pointing at `/token`.
+        async fn mount_challenge(server: &MockServer) {
+            let challenge = format!(
+                r#"Bearer realm="{}/token",service="test",scope="repository:org/app:pull""#,
+                server.uri()
+            );
+            Mock::given(path(MANIFEST))
+                .respond_with(
+                    ResponseTemplate::new(401)
+                        .insert_header("WWW-Authenticate", challenge.as_str()),
+                )
+                .with_priority(10)
+                .mount(server)
+                .await;
+        }
+
+        /// Token endpoint, expected to be hit exactly once (checked on drop).
+        async fn mount_token(server: &MockServer, basic: Option<&str>) {
+            let mut mock = Mock::given(method("GET"))
+                .and(path("/token"))
+                .and(query_param("service", "test"))
+                .and(query_param("scope", "repository:org/app:pull"));
+            if let Some(basic) = basic {
+                mock = mock.and(header("authorization", basic));
+            }
+            mock.respond_with(ResponseTemplate::new(200).set_body_string(r#"{"token":"issued"}"#))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        async fn mount_authorized_get(server: &MockServer) {
+            Mock::given(method("GET"))
+                .and(path(MANIFEST))
+                .and(header("authorization", "Bearer issued"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn answers_challenge_and_reuses_token() {
+            let server = MockServer::start().await;
+            mount_challenge(&server).await;
+            mount_token(&server, None).await;
+            mount_authorized_get(&server).await;
+            let base = Url::parse(&server.uri()).unwrap();
+            let client = SimpleRegistryClient::new(None);
+            for _ in 0..2 {
+                let response = client
+                    .get_manifest(&base, "org/app", "latest")
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+
+        #[tokio::test]
+        async fn exchanges_basic_credentials_for_token() {
+            let server = MockServer::start().await;
+            mount_challenge(&server).await;
+            // base64("user:pass")
+            mount_token(&server, Some("Basic dXNlcjpwYXNz")).await;
+            mount_authorized_get(&server).await;
+            let base = Url::parse(&server.uri()).unwrap();
+            let client = SimpleRegistryClient::new(Some(Token::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            }));
+            let response = client
+                .get_manifest(&base, "org/app", "latest")
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn retries_with_request_body() {
+            let server = MockServer::start().await;
+            mount_challenge(&server).await;
+            mount_token(&server, None).await;
+            Mock::given(method("PUT"))
+                .and(path(MANIFEST))
+                .and(header("authorization", "Bearer issued"))
+                .and(body_string("manifest"))
+                .respond_with(ResponseTemplate::new(201))
+                .mount(&server)
+                .await;
+            let base = Url::parse(&server.uri()).unwrap();
+            let client = SimpleRegistryClient::new(None);
+            let body = Bytes::from_static(b"manifest");
+            let response = client
+                .put_manifest(&base, "org/app", "latest", "application/json", body)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        #[tokio::test]
+        async fn passes_through_401_without_bearer_challenge() {
+            let server = MockServer::start().await;
+            Mock::given(path(MANIFEST))
+                .respond_with(
+                    ResponseTemplate::new(401)
+                        .insert_header("WWW-Authenticate", r#"Basic realm="x""#),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let base = Url::parse(&server.uri()).unwrap();
+            let client = SimpleRegistryClient::new(None);
+            let response = client
+                .get_manifest(&base, "org/app", "latest")
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn accepts_access_token_field() {
+            let server = MockServer::start().await;
+            mount_challenge(&server).await;
+            Mock::given(path("/token"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(r#"{"access_token":"issued"}"#),
+                )
+                .mount(&server)
+                .await;
+            mount_authorized_get(&server).await;
+            let base = Url::parse(&server.uri()).unwrap();
+            let client = SimpleRegistryClient::new(None);
+            let response = client
+                .get_manifest(&base, "org/app", "latest")
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn ignores_challenge_from_redirect_target() {
+            let registry = MockServer::start().await;
+            let cdn = MockServer::start().await;
+            Mock::given(path(MANIFEST))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("Location", format!("{}/blob", cdn.uri()).as_str()),
+                )
+                .mount(&registry)
+                .await;
+            let challenge = format!(r#"Bearer realm="{}/token""#, cdn.uri());
+            Mock::given(path("/blob"))
+                .respond_with(
+                    ResponseTemplate::new(401)
+                        .insert_header("WWW-Authenticate", challenge.as_str()),
+                )
+                .mount(&cdn)
+                .await;
+            Mock::given(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"token":"t"}"#))
+                .expect(0)
+                .mount(&cdn)
+                .await;
+            let base = Url::parse(&registry.uri()).unwrap();
+            let client = SimpleRegistryClient::new(Some(Token::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            }));
+            let response = client
+                .get_manifest(&base, "org/app", "latest")
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn issued_token_stays_with_its_origin() {
+            let server = MockServer::start().await;
+            let storage = MockServer::start().await;
+            mount_challenge(&server).await;
+            mount_token(&server, None).await;
+            mount_authorized_get(&server).await;
+            Mock::given(header("authorization", "Bearer issued"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&storage)
+                .await;
+            Mock::given(method("PATCH"))
+                .respond_with(ResponseTemplate::new(202))
+                .mount(&storage)
+                .await;
+            let base = Url::parse(&server.uri()).unwrap();
+            let client = SimpleRegistryClient::new(None);
+            client
+                .get_manifest(&base, "org/app", "latest")
+                .await
+                .unwrap();
+            let upload = Url::parse(&format!("{}/upload", storage.uri())).unwrap();
+            let response = client
+                .upload_part(&upload, Bytes::from_static(b"data"), 0, 4)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        #[tokio::test]
+        async fn configured_bearer_token_is_not_replaced() {
+            let server = MockServer::start().await;
+            mount_challenge(&server).await;
+            Mock::given(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"token":"anon"}"#))
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(path("/v2/other/manifests/latest"))
+                .and(header("authorization", "Bearer configured"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let base = Url::parse(&server.uri()).unwrap();
+            let client = SimpleRegistryClient::new(Some(Token::Bearer("configured".into())));
+            let response = client
+                .get_manifest(&base, "org/app", "latest")
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response = client.get_manifest(&base, "other", "latest").await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 }

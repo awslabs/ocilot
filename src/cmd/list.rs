@@ -32,7 +32,7 @@ impl List {
             registry_uri.set_secure(false);
         }
         let registry = Registry::new(&registry_uri).await?;
-        let repository = Repository::new(&registry, object);
+        let repository = Repository::new(&registry, &registry_uri.normalize_repository(object));
         let tags = repository.tags().await?;
         println!("{}", tags.join("\n"));
         Ok(())

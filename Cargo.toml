@@ -90,3 +90,6 @@ aws = [
 ]
 compression = ["dep:async-compression"]
 progress = ["dep:indicatif", "dep:tracing-indicatif"]
+
+[dev-dependencies]
+wiremock = "0.6"
