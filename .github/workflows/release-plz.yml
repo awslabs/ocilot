@@ -34,6 +34,8 @@ jobs:
     permissions:
       pull-requests: write
       contents: write
+      # To dispatch CI on the release PR branch.
+      actions: write
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
@@ -45,8 +47,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
+        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Pushes made with GITHUB_TOKEN don't start workflows, so the release PR
+      # would never get the required CI check. A dispatch is the exception.
+      - name: Run CI on the release PR
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ fromJSON(steps.release-plz.outputs.pr).head_branch }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
