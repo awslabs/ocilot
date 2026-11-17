@@ -99,14 +99,16 @@ impl Registry {
         if token.is_none()
             && let Some(home) = home_dir()
         {
-            for file in COMMON_AUTH_FILES {
+            'files: for file in COMMON_AUTH_FILES {
                 let path: PathBuf = home.join(file);
                 if !path.exists() {
                     continue;
                 }
-                if let Some(found) = read_auth_file(&path, uri.base()).await? {
-                    token = Some(found);
-                    break;
+                for key in uri.auth_keys() {
+                    if let Some(found) = read_auth_file(&path, key).await? {
+                        token = Some(found);
+                        break 'files;
+                    }
                 }
             }
         }

@@ -80,6 +80,8 @@ Manifest::fetch(&uri)
 
 Ocilot will handle automatic authorization with aws ecr both private and public based on the aws credentials in the calling environment. Any other registry credentials must be done via using `docker login`
 
+Registries that issue bearer-token challenges, such as Docker Hub and GHCR, work anonymously for public images. A username and password from `docker login` are exchanged for a token when present; identity tokens are not. Docker Hub can be addressed as `docker.io`, and official images may omit `library/` (`docker.io/alpine:3.20`).
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.

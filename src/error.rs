@@ -55,6 +55,8 @@ pub enum Error {
     },
     #[snafu(display("{context}: credential is missing the ':' separator"))]
     AuthMissingSeparator { context: &'static str },
+    #[snafu(display("failed to get a registry token from {realm}: {reason}"))]
+    AuthToken { realm: String, reason: String },
     #[snafu(display("blob with digest {digest} is missing from oci archive"))]
     BlobMissing { digest: String },
     #[snafu(display("failed to deserialize image configuration received from registry: {source}"))]
