@@ -11,8 +11,8 @@ use bon::Builder;
 use futures::future::try_join_all;
 use snafu::{ResultExt, ensure};
 use tempfile::{TempDir, tempdir};
-use tokio::fs::{File, create_dir_all};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::fs::create_dir_all;
+use tokio::io::AsyncWrite;
 use tokio::task::JoinHandle;
 
 use crate::digest::Digest;
@@ -162,13 +162,9 @@ impl OciLayout {
             let root = self.dir.path().to_path_buf();
             let progress = progress.clone();
             tasks.push(tokio::spawn(async move {
+                let path = blob_path(&root, blob.digest()).await?;
                 let mut reader = blob.open(&uri, progress.as_ref()).await?;
-                let mut file = File::create(blob_path(&root, blob.digest()).await?)
-                    .await
-                    .context(error::FileSnafu)?;
-                Layer::copy(&mut reader, &mut file, blob.size()).await?;
-                reader.verify().await?;
-                file.flush().await.context(error::FileSnafu)
+                reader.save(&path, blob.size()).await
             }));
         }
         // try_join_all aborts on first error and surfaces JoinErrors
@@ -334,7 +330,7 @@ mod tests {
     async fn finish_archives_layout() {
         let layout = OciLayout::new().await.unwrap();
         let out = tempfile::NamedTempFile::new().unwrap();
-        let file = File::from_std(out.reopen().unwrap());
+        let file = tokio::fs::File::from_std(out.reopen().unwrap());
         layout
             .finish(&uri().await, descriptor(), &OciOptions::default(), file)
             .await
