@@ -14,8 +14,10 @@ use sha2::{Digest, Sha256, Sha512};
 use snafu::{ResultExt, ensure};
 use std::cmp::min;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_util::io::StreamReader;
 use url::Url;
@@ -321,6 +323,18 @@ impl Reader {
             .await
             .context(error::LayerReadSnafu)?;
         Ok(())
+    }
+
+    /// Copy exactly `size` bytes into a new file at `path` and verify the
+    /// stream. The file is fully written (though not fsynced) on return.
+    pub(crate) async fn save(&mut self, path: &Path, size: usize) -> crate::Result<()> {
+        let mut file = File::create(path).await.context(error::FileSnafu)?;
+        Layer::copy(self, &mut file, size).await?;
+        self.verify().await?;
+        // tokio finishes each write on a blocking thread after `write` returns;
+        // flush waits for the last one and surfaces its error instead of
+        // leaving a short file for whoever reads `path` next.
+        file.flush().await.context(error::FileSnafu)
     }
 }
 
@@ -1007,5 +1021,25 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert!(err.to_string().contains("sha384"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn save_leaves_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Without a flush the last write may still be in flight when `save`
+        // returns; it usually is, but not always, hence the repetition.
+        let data = vec![7u8; 3 << 20];
+        for i in 0..50 {
+            let path = dir.path().join(format!("blob{i}"));
+            let mut reader = Reader::new(
+                std::io::Cursor::new(data.clone()),
+                Box::new(NoopHandle),
+                None,
+                Some(data.len()),
+            )
+            .unwrap();
+            reader.save(&path, data.len()).await.unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), data.len() as u64);
+        }
     }
 }

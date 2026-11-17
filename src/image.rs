@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, ensure};
 use std::collections::HashSet;
 use tempfile::tempdir;
-use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
@@ -215,11 +214,12 @@ impl Image {
             .build();
         let tmp_dir = tempdir().context(error::TempSnafu)?;
         let mut config_reader = self.config.open(uri, progress.as_ref()).await?;
-        let mut config_file = File::create(tmp_dir.path().join(self.config.digest()))
-            .await
-            .context(error::FileSnafu)?;
-        Layer::copy(&mut config_reader, &mut config_file, self.config.size()).await?;
-        config_reader.verify().await?;
+        config_reader
+            .save(
+                &tmp_dir.path().join(self.config.digest()),
+                self.config.size(),
+            )
+            .await?;
 
         // Each spawned task gets its own clone of the Arc-backed
         // SharedProgress; no `unsafe` lifetime extension required.
@@ -238,11 +238,9 @@ impl Image {
                     parsed.hex(),
                     layer.media_type().compression().to_ext()
                 );
-                let mut blob_file = File::create(tmp_path.join(blob_layer.clone()))
-                    .await
-                    .context(error::FileSnafu)?;
-                Layer::copy(&mut reader, &mut blob_file, layer.size()).await?;
-                reader.verify().await?;
+                reader
+                    .save(&tmp_path.join(&blob_layer), layer.size())
+                    .await?;
                 Ok(blob_layer)
             }));
         }
