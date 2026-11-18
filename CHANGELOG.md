@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/awslabs/ocilot/compare/v0.3.0...v0.4.0) - 2026-11-18
+
+### Added
+
+- *(registry)* support bearer token auth challenges
+
+### Fixed
+
+- flush staged blobs before archiving them
+- migrate from tokio-tar to tar
+
+### Other
+
+- check pull requests, pushes to main and nightly
+- *(deps)* update Cargo.lock
+
 ## [0.3.0](https://github.com/awslabs/ocilot/compare/v0.2.4...v0.3.0) - 2026-10-16
 
 ### Added
